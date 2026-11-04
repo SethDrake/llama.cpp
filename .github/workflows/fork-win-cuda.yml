@@ -1,0 +1,148 @@
+# Fork build: one Windows x64 CUDA 12.4 package, laid out like the upstream release zip
+# (CPU backends + llama-server built with clang, ggml-cuda built with MSVC/nvcc, CUDA runtime DLLs).
+name: Fork Windows CUDA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'perf/**'
+    paths: [
+      '.github/workflows/fork-win-cuda.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.cu',
+      '**/*.cuh'
+    ]
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DLLAMA_CONNECT=ON"
+
+concurrency:
+  group: fork-win-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-build:
+    uses: ./.github/workflows/ui-build.yml
+
+  windows-cpu:
+    needs: [ui-build]
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download UI build
+        uses: actions/download-artifact@v8
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: fork-windows-2025-vs2026-x64-cpu
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cpu-bin
+          path: build/bin/Release/*
+
+  windows-cuda:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: fork-windows-2022-x64-cuda-12.4
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Collect ggml-cuda and CUDA runtime
+        run: |
+          $dst = '.\out\'
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Copy-Item .\build\bin\Release\ggml-cuda.dll $dst
+          robocopy "${{ env.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          exit 0
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cuda-bin
+          path: out/*
+
+  package:
+    needs: [windows-cpu, windows-cuda]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: cpu-bin
+          path: pkg
+      - uses: actions/download-artifact@v8
+        with:
+          name: cuda-bin
+          path: pkg
+
+      - name: Name the package
+        id: name
+        run: echo "zip=llama-${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}-bin-win-cuda-12.4-x64" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.name.outputs.zip }}
+          path: pkg/*
+          retention-days: 30
