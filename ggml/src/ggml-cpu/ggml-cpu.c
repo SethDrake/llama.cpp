@@ -3174,6 +3174,68 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// TEMP profiling (GGML_CPU_PROF=1): per op time of thread 0 (compute and barrier wait), keyed by the
+// number of tokens of the graph (from its MUL_MAT_ID ids); MUL_MAT_ID is split by the type of src0.
+// Cumulative totals are printed every 2000 graphs.
+#define CPU_PROF_BUCKETS 8
+#define CPU_PROF_KEYS (GGML_OP_COUNT + GGML_TYPE_COUNT)
+struct cpu_prof_ent { double compute_us; double wait_us; int64_t n; };
+static int                 cpu_prof_on = -1;
+static int                 cpu_prof_bucket = 0;
+static int64_t             cpu_prof_graphs[CPU_PROF_BUCKETS];
+static double              cpu_prof_wall[CPU_PROF_BUCKETS];
+static int64_t             cpu_prof_total = 0;
+static struct cpu_prof_ent cpu_prof[CPU_PROF_BUCKETS][CPU_PROF_KEYS];
+
+static bool cpu_prof_enabled(void) {
+    if (cpu_prof_on < 0) {
+        const char * e = getenv("GGML_CPU_PROF");
+        cpu_prof_on = e && e[0] == '1';
+    }
+    return cpu_prof_on == 1;
+}
+
+static int cpu_prof_key(const struct ggml_tensor * node) {
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        return GGML_OP_COUNT + node->src[0]->type;
+    }
+    return node->op;
+}
+
+static void cpu_prof_print(void) {
+    for (int b = 0; b < CPU_PROF_BUCKETS; b++) {
+        if (cpu_prof_graphs[b] == 0) {
+            continue;
+        }
+        double sum_c = 0.0, sum_w = 0.0;
+        for (int k = 0; k < CPU_PROF_KEYS; k++) {
+            sum_c += cpu_prof[b][k].compute_us;
+            sum_w += cpu_prof[b][k].wait_us;
+        }
+        fprintf(stderr, "cpu-prof ntok=%d graphs=%lld wall=%.1fms compute=%.1fms wait=%.1fms |", b,
+            (long long) cpu_prof_graphs[b], cpu_prof_wall[b]/1000.0, sum_c/1000.0, sum_w/1000.0);
+        // the 8 most expensive keys
+        bool used[CPU_PROF_KEYS] = { false };
+        for (int r = 0; r < 8; r++) {
+            int best = -1;
+            for (int k = 0; k < CPU_PROF_KEYS; k++) {
+                if (!used[k] && cpu_prof[b][k].n > 0 &&
+                        (best < 0 || cpu_prof[b][k].compute_us + cpu_prof[b][k].wait_us > cpu_prof[b][best].compute_us + cpu_prof[b][best].wait_us)) {
+                    best = k;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            used[best] = true;
+            const char * name = best < GGML_OP_COUNT ? ggml_op_name((enum ggml_op) best) : ggml_type_name((enum ggml_type) (best - GGML_OP_COUNT));
+            fprintf(stderr, " %s%s n=%lld c=%.1f w=%.1f", best < GGML_OP_COUNT ? "" : "MMID:", name,
+                (long long) cpu_prof[b][best].n, cpu_prof[b][best].compute_us/1000.0, cpu_prof[b][best].wait_us/1000.0);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3216,12 +3278,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const bool prof = state->ith == 0 && cpu_prof_on == 1;
+        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
+        const int prof_key = prof ? cpu_prof_key(node) : 0;
+
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
         }
+        const int64_t prof_t1 = prof ? ggml_time_us() : 0;
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3231,6 +3298,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+        if (prof) {
+            struct cpu_prof_ent * e = &cpu_prof[cpu_prof_bucket][prof_key];
+            e->compute_us += (double) (prof_t1 - prof_t0);
+            e->wait_us    += (double) (ggml_time_us() - prof_t1);
+            e->n++;
         }
     }
 
@@ -3492,6 +3565,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    const bool prof = cpu_prof_enabled();
+    const int64_t prof_t0 = prof ? ggml_time_us() : 0;
+    if (prof) {
+        int64_t ntok = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+                ntok = cgraph->nodes[i]->src[2]->ne[1];
+                break;
+            }
+        }
+        cpu_prof_bucket = (int) MIN(ntok, CPU_PROF_BUCKETS - 1);
+    }
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3531,6 +3617,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    if (prof) {
+        cpu_prof_wall[cpu_prof_bucket] += (double) (ggml_time_us() - prof_t0);
+        cpu_prof_graphs[cpu_prof_bucket]++;
+        if (++cpu_prof_total % 2000 == 0) {
+            cpu_prof_print();
+        }
+    }
 
     enum ggml_status ret = threadpool->ec;
 

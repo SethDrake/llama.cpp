@@ -2122,11 +2122,92 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// TEMP profiling (GGML_SCHED_PROF=1): host wall time of each graph step, split by phase,
+// keyed by scheduler and number of tokens; cumulative totals are printed every 100 steps of a key.
+enum { SP_SYNC, SP_COPY_IN, SP_COPY_HOSTW, SP_CPU, SP_DEV_LAUNCH, SP_FINAL_SYNC, SP_OUTSIDE, SP_COUNT };
+static const char * sp_names[SP_COUNT] = { "split_sync", "copy_in", "copy_hostw", "cpu_compute", "dev_launch", "final_sync", "outside" };
+struct sched_prof_ent {
+    const void * sched;
+    int64_t      ntok;
+    int64_t      steps;
+    int64_t      splits;
+    int64_t      cpu_splits;
+    double       us[SP_COUNT];
+};
+static int                    sched_prof_on = -1;
+static sched_prof_ent         sched_prof[16];
+static int                    sched_prof_n = 0;
+static sched_prof_ent *       sched_prof_cur = nullptr;
+static int64_t                sched_prof_t_end = 0;
+
+static bool sched_prof_enabled() {
+    if (sched_prof_on < 0) {
+        const char * e = getenv("GGML_SCHED_PROF");
+        sched_prof_on = e && e[0] == '1';
+    }
+    return sched_prof_on == 1;
+}
+
+static sched_prof_ent * sched_prof_get(const void * sched, int64_t ntok) {
+    for (int i = 0; i < sched_prof_n; i++) {
+        if (sched_prof[i].sched == sched && sched_prof[i].ntok == ntok) {
+            return &sched_prof[i];
+        }
+    }
+    if (sched_prof_n == 16) {
+        return &sched_prof[15];
+    }
+    sched_prof_ent * e = &sched_prof[sched_prof_n++];
+    memset(e, 0, sizeof(*e));
+    e->sched = sched;
+    e->ntok  = ntok;
+    return e;
+}
+
+static void sched_prof_print(const sched_prof_ent * e) {
+    const double n = (double) e->steps;
+    double total = 0.0;
+    for (int i = 0; i < SP_COUNT; i++) {
+        total += e->us[i];
+    }
+    fprintf(stderr, "sched-prof sched=%p ntok=%lld steps=%lld splits/step=%.1f cpu_splits/step=%.1f total=%.2fms/step |",
+        e->sched, (long long) e->ntok, (long long) e->steps, e->splits/n, e->cpu_splits/n, total/n/1000.0);
+    for (int i = 0; i < SP_COUNT; i++) {
+        fprintf(stderr, " %s=%.2f", sp_names[i], e->us[i]/n/1000.0);
+    }
+    fprintf(stderr, "\n");
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
+
+    const bool prof = sched_prof_enabled();
+    sched_prof_ent * pe = nullptr;
+    int64_t pt = 0;
+    if (prof) {
+        int64_t ntok = 0;
+        for (int si = 0; si < sched->n_splits && ntok == 0; si++) {
+            for (int ni = 0; ni < splits[si].graph.n_nodes; ni++) {
+                const ggml_tensor * t = splits[si].graph.nodes[ni];
+                if (t->op == GGML_OP_MUL_MAT_ID) {
+                    ntok = t->src[2]->ne[1];
+                    break;
+                }
+            }
+        }
+        pe = sched_prof_get(sched, ntok);
+        pt = ggml_time_us();
+        if (sched_prof_t_end > 0 && sched_prof_cur == pe) {
+            pe->us[SP_OUTSIDE] += (double) (pt - sched_prof_t_end);
+        }
+        sched_prof_cur = pe;
+        pe->steps++;
+        pe->splits += sched->n_splits;
+    }
+#define SCHED_PROF_MARK(k) do { if (prof) { const int64_t t_ = ggml_time_us(); pe->us[k] += (double) (t_ - pt); pt = t_; } } while (0)
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -2142,6 +2223,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
+        SCHED_PROF_MARK(SP_SYNC);
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
@@ -2150,11 +2232,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        SCHED_PROF_MARK(SP_COPY_IN);
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        SCHED_PROF_MARK(SP_COPY_HOSTW);
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2195,12 +2279,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (prof) {
+            const bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            pe->cpu_splits += is_cpu;
+            SCHED_PROF_MARK(is_cpu ? SP_CPU : SP_DEV_LAUNCH);
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+    }
+#undef SCHED_PROF_MARK
+
+    if (prof) {
+        sched_prof_t_end = ggml_time_us();
+        if (pe->steps % 100 == 0) {
+            sched_prof_print(pe);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2392,8 +2490,18 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const int64_t t0 = sched_prof_enabled() ? ggml_time_us() : 0;
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (t0 > 0 && sched_prof_cur != nullptr && sched_prof_cur->sched == sched) {
+        const int64_t t1 = ggml_time_us();
+        sched_prof_cur->us[SP_FINAL_SYNC] += (double) (t1 - t0);
+        // the time until the next step is counted as outside from here
+        if (sched_prof_t_end > 0 && sched_prof_t_end < t0) {
+            sched_prof_cur->us[SP_OUTSIDE] += (double) (t0 - sched_prof_t_end);
+        }
+        sched_prof_t_end = t1;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
