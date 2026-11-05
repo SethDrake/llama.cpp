@@ -1517,6 +1517,63 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     float tmp[16];
 
+#ifdef GGML_CPU_HAS_VEC_DOT_COLS
+    // Several tokens routed to this expert: decode each weight row once for up to 4 tokens.
+    // GGML_VEC_DOT_COLS=0 disables this path; GGML_COLS_CHECK=1 compares every result with vec_dot (debug).
+    static int cols_enabled = -1;
+    static int cols_check   = 0;
+    if (cols_enabled < 0) {
+        const char * e = getenv("GGML_VEC_DOT_COLS");
+        const char * c = getenv("GGML_COLS_CHECK");
+        cols_check   = c && c[0] == '1';
+        cols_enabled = !(e && e[0] == '0');
+    }
+    ggml_vec_dot_cols_t const vec_dot_cols = cols_enabled && ir1_end - ir1_start > 1 ? ggml_cpu_get_vec_dot_cols(type) : NULL;
+    if (vec_dot_cols != NULL) {
+        float tmp4[GGML_VEC_DOT_COLS_MAX][16];
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += GGML_VEC_DOT_COLS_MAX) {
+            const int nc = (int) MIN(GGML_VEC_DOT_COLS_MAX, ir1_end - iir1);
+            const void * cols[GGML_VEC_DOT_COLS_MAX];
+            float * dst_cols[GGML_VEC_DOT_COLS_MAX];
+            for (int c = 0; c < nc; ++c) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + c);
+                const int64_t id  = row_mapping.i1;
+                const int64_t i11 = id % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[c] = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+                dst_cols[c] = (float *) ((char *) dst->data + (id*nb1 + i12*nb2));
+            }
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                const int64_t nr = MIN(iir0 + blck_0, ir0_end) - iir0;
+                for (int64_t r = 0; r < nr; ++r) {
+                    const char * row = src0_cur + (iir0 + r)*nb01;
+                    float s[GGML_VEC_DOT_COLS_MAX];
+                    vec_dot_cols(ne00, s, row, cols, nc);
+                    for (int c = 0; c < nc; ++c) {
+                        if (cols_check) {
+                            float ref;
+                            vec_dot(ne00, &ref, 0, row, 0, cols[c], 0, 1);
+                            if (memcmp(&ref, &s[c], sizeof(float)) != 0) {
+                                fprintf(stderr, "vec_dot_cols mismatch: type=%s ncols=%d col=%d ref=%.9g got=%.9g\n",
+                                    ggml_type_name(type), nc, c, ref, s[c]);
+                                GGML_ABORT("vec_dot_cols mismatch");
+                            }
+                        }
+                        tmp4[c][r] = s[c];
+                    }
+                }
+                for (int c = 0; c < nc; ++c) {
+                    memcpy(&dst_cols[c][iir0], tmp4[c], nr*sizeof(float));
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
