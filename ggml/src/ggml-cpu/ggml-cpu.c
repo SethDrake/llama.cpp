@@ -3136,9 +3136,295 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 
+// Fused MoE expert chain: MUL_MAT_ID(gate) + MUL_MAT_ID(up) + GLU(swiglu, split) + MUL_MAT_ID(down).
+// The threads take (expert, row chunk) tasks from a shared counter: first the gate and up rows with the
+// swiglu, then the down rows, with one barrier between the two phases instead of one or two per op.
+// The kernels, the quantization and the swiglu are the same as in the unfused ops, so the results are
+// bit-identical. GGML_MOE_FUSE=0 disables it.
+
+#define MOE_FUSE_UP_CHUNK   64
+#define MOE_FUSE_DOWN_CHUNK 256
+#define MOE_FUSE_GROUP      4
+#define MOE_FUSE_MAX_GROUPS 256
+
+struct moe_fuse_group {
+    int32_t expert;
+    int32_t n;
+    int32_t slot[MOE_FUSE_GROUP];
+    int32_t tok[MOE_FUSE_GROUP];
+};
+
+static bool moe_fuse_match(const struct ggml_cgraph * cgraph, int node_n,
+        const struct ggml_tensor ** gate_out, const struct ggml_tensor ** up_out,
+        const struct ggml_tensor ** glu_out, struct ggml_tensor ** down_out) {
+    if (node_n + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const struct ggml_tensor * a    = cgraph->nodes[node_n];
+    const struct ggml_tensor * b    = cgraph->nodes[node_n + 1];
+    const struct ggml_tensor * glu  = cgraph->nodes[node_n + 2];
+    struct ggml_tensor       * down = cgraph->nodes[node_n + 3];
+
+    if (a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU || down->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        const struct ggml_tensor * n = cgraph->nodes[node_n + i];
+        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (i < 3 && (n->flags & GGML_TENSOR_FLAG_OUTPUT))) {
+            return false;
+        }
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == NULL || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    const struct ggml_tensor * gate = glu->src[0];
+    const struct ggml_tensor * up   = glu->src[1];
+    if (!((gate == a && up == b) || (gate == b && up == a))) {
+        return false;
+    }
+    if (down->src[1] != glu || gate->src[1] != up->src[1] || gate->src[2] != up->src[2] || down->src[2] != gate->src[2]) {
+        return false;
+    }
+
+    const struct ggml_tensor * x   = gate->src[1];
+    const struct ggml_tensor * ids = gate->src[2];
+    const int64_t n_ff = gate->ne[0];
+
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[3] != 1 || ids->type != GGML_TYPE_I32 ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        down->type != GGML_TYPE_F32 || down->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (up->ne[0] != n_ff || glu->ne[0] != n_ff || down->src[0]->ne[0] != n_ff ||
+        gate->ne[1] != ids->ne[0] || gate->ne[2] != ids->ne[1] || ids->ne[0]*ids->ne[1] > MOE_FUSE_MAX_GROUPS) {
+        return false;
+    }
+    if (n_ff % MOE_FUSE_UP_CHUNK != 0) {
+        // the swiglu chunks must keep the vector lanes of the unfused op
+        return false;
+    }
+
+    const enum ggml_type vdt_gu = type_traits_cpu[gate->src[0]->type].vec_dot_type;
+    const enum ggml_type vdt_dn = type_traits_cpu[down->src[0]->type].vec_dot_type;
+    if (vdt_gu != type_traits_cpu[up->src[0]->type].vec_dot_type || vdt_gu == GGML_TYPE_F32 || vdt_dn == GGML_TYPE_F32 ||
+        x->ne[0] % ggml_blck_size(vdt_gu) != 0 || n_ff % ggml_blck_size(vdt_dn) != 0) {
+        return false;
+    }
+
+    *gate_out = gate;
+    *up_out   = up;
+    *glu_out  = glu;
+    *down_out = down;
+    return true;
+}
+
+static size_t moe_fuse_wsize(const struct ggml_tensor * gate, const struct ggml_tensor * down, int nth) {
+    const struct ggml_tensor * x = gate->src[1];
+    const enum ggml_type vdt_gu = type_traits_cpu[gate->src[0]->type].vec_dot_type;
+    const enum ggml_type vdt_dn = type_traits_cpu[down->src[0]->type].vec_dot_type;
+    return GGML_PAD(ggml_row_size(vdt_gu, x->ne[0])*x->ne[1]*x->ne[2], CACHE_LINE_SIZE) + 2*CACHE_LINE_SIZE +
+        (size_t) nth*MOE_FUSE_GROUP*ggml_row_size(vdt_dn, gate->ne[0]) + CACHE_LINE_SIZE;
+}
+
+static void ggml_compute_forward_moe_fused(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * gate,
+        const struct ggml_tensor * up,
+        const struct ggml_tensor * glu,
+        struct ggml_tensor * down) {
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const struct ggml_tensor * x   = gate->src[1];
+    const struct ggml_tensor * ids = gate->src[2];
+    const struct ggml_tensor * wg  = gate->src[0];
+    const struct ggml_tensor * wu  = up->src[0];
+    const struct ggml_tensor * wd  = down->src[0];
+
+    const int64_t n_in  = x->ne[0];
+    const int64_t ne11  = x->ne[1];
+    const int64_t n_ff  = gate->ne[0];
+    const int64_t n_out = wd->ne[1];
+    const int     n_ids = (int) ids->ne[0];
+    const int     n_tok = (int) ids->ne[1];
+
+    const enum ggml_type vdt_gu = type_traits_cpu[wg->type].vec_dot_type;
+    const enum ggml_type vdt_dn = type_traits_cpu[wd->type].vec_dot_type;
+
+    ggml_vec_dot_t const dot_g = type_traits_cpu[wg->type].vec_dot;
+    ggml_vec_dot_t const dot_u = type_traits_cpu[wu->type].vec_dot;
+    ggml_vec_dot_t const dot_d = type_traits_cpu[wd->type].vec_dot;
+#ifdef GGML_CPU_HAS_VEC_DOT_COLS
+    ggml_vec_dot_cols_t const cols_g = ggml_cpu_get_vec_dot_cols(wg->type);
+    ggml_vec_dot_cols_t const cols_u = ggml_cpu_get_vec_dot_cols(wu->type);
+    ggml_vec_dot_cols_t const cols_d = ggml_cpu_get_vec_dot_cols(wd->type);
+#endif
+
+    const size_t row_gu = ggml_row_size(vdt_gu, n_in);
+    const size_t row_dn = ggml_row_size(vdt_dn, n_ff);
+
+    // work buffer: the quantized input rows, two task counters, the per thread quantized swiglu rows
+    char * wdata = (char *) params->wdata;
+    char * xq = wdata;
+    char * cnt_base = wdata + GGML_PAD(row_gu*ne11*x->ne[2], CACHE_LINE_SIZE);
+    atomic_int * cnt_up   = (atomic_int *) cnt_base;
+    atomic_int * cnt_down = (atomic_int *) (cnt_base + CACHE_LINE_SIZE);
+    char * hq = cnt_base + 2*CACHE_LINE_SIZE + (size_t) ith*MOE_FUSE_GROUP*row_dn;
+
+    // quantize the input rows, each thread a slice of blocks of every row
+    {
+        ggml_from_float_t const from_float = type_traits_cpu[vdt_gu].from_float;
+        const int64_t bs = ggml_blck_size(vdt_gu);
+        const int64_t b0 = (ith*(n_in/bs))/nth;
+        const int64_t b1 = ((ith + 1)*(n_in/bs))/nth;
+        if (b1 > b0) {
+            for (int64_t i12 = 0; i12 < x->ne[2]; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    from_float((const float *) ((const char *) x->data + i11*x->nb[1] + i12*x->nb[2] + b0*bs*sizeof(float)),
+                        xq + (i11 + i12*ne11)*row_gu + b0*ggml_type_size(vdt_gu), (b1 - b0)*bs);
+                }
+            }
+        }
+    }
+
+    // group the (slot, token) pairs of each expert, the same on every thread
+    struct moe_fuse_group groups[MOE_FUSE_MAX_GROUPS];
+    int n_groups = 0;
+    for (int t = 0; t < n_tok; ++t) {
+        for (int s = 0; s < n_ids; ++s) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + s*ids->nb[0]);
+            if (e < 0) {
+                if (ith == 0) {
+                    memset((char *) down->data + s*down->nb[1] + t*down->nb[2], 0, n_out*sizeof(float));
+                }
+                continue;
+            }
+            int g = n_groups - 1;
+            while (g >= 0 && !(groups[g].expert == e && groups[g].n < MOE_FUSE_GROUP)) {
+                --g;
+            }
+            if (g < 0) {
+                g = n_groups++;
+                groups[g].expert = e;
+                groups[g].n = 0;
+            }
+            groups[g].slot[groups[g].n] = s;
+            groups[g].tok[groups[g].n]  = t;
+            groups[g].n++;
+        }
+    }
+
+    if (ith == 0) {
+        atomic_store_explicit(cnt_up,   0, memory_order_relaxed);
+        atomic_store_explicit(cnt_down, 0, memory_order_relaxed);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // phase 1: gate and up rows with the swiglu, into the GLU tensor
+    {
+        const int n_chunks = (int) (n_ff/MOE_FUSE_UP_CHUNK);
+        const int n_tasks  = n_groups*n_chunks;
+        float gtmp[MOE_FUSE_GROUP][MOE_FUSE_UP_CHUNK];
+        float utmp[MOE_FUSE_GROUP][MOE_FUSE_UP_CHUNK];
+
+        for (int task = atomic_fetch_add_explicit(cnt_up, 1, memory_order_relaxed); task < n_tasks;
+                 task = atomic_fetch_add_explicit(cnt_up, 1, memory_order_relaxed)) {
+            const struct moe_fuse_group * gr = &groups[task / n_chunks];
+            const int64_t r0 = (int64_t) (task % n_chunks)*MOE_FUSE_UP_CHUNK;
+            const int nc = gr->n;
+
+            const void * cols[MOE_FUSE_GROUP];
+            for (int c = 0; c < nc; ++c) {
+                cols[c] = xq + (gr->slot[c] % ne11 + gr->tok[c]*ne11)*row_gu;
+            }
+            const char * g_base = (const char *) wg->data + gr->expert*wg->nb[2];
+            const char * u_base = (const char *) wu->data + gr->expert*wu->nb[2];
+
+            for (int r = 0; r < MOE_FUSE_UP_CHUNK; ++r) {
+                const char * g_row = g_base + (r0 + r)*wg->nb[1];
+                const char * u_row = u_base + (r0 + r)*wu->nb[1];
+#ifdef GGML_CPU_HAS_VEC_DOT_COLS
+                if (nc > 1 && cols_g != NULL && cols_u != NULL) {
+                    float sg[MOE_FUSE_GROUP], su[MOE_FUSE_GROUP];
+                    cols_g((int) n_in, sg, g_row, cols, nc);
+                    cols_u((int) n_in, su, u_row, cols, nc);
+                    for (int c = 0; c < nc; ++c) {
+                        gtmp[c][r] = sg[c];
+                        utmp[c][r] = su[c];
+                    }
+                    continue;
+                }
+#endif
+                for (int c = 0; c < nc; ++c) {
+                    dot_g((int) n_in, &gtmp[c][r], 0, g_row, 0, cols[c], 0, 1);
+                    dot_u((int) n_in, &utmp[c][r], 0, u_row, 0, cols[c], 0, 1);
+                }
+            }
+            for (int c = 0; c < nc; ++c) {
+                float * h = (float *) ((char *) glu->data + gr->slot[c]*glu->nb[1] + gr->tok[c]*glu->nb[2]);
+                ggml_vec_swiglu_f32(MOE_FUSE_UP_CHUNK, h + r0, gtmp[c], utmp[c]);
+            }
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // phase 2: down rows; each task quantizes the swiglu rows of its group itself
+    {
+        ggml_from_float_t const from_float = type_traits_cpu[vdt_dn].from_float;
+        const int n_chunks = (int) ((n_out + MOE_FUSE_DOWN_CHUNK - 1)/MOE_FUSE_DOWN_CHUNK);
+        const int n_tasks  = n_groups*n_chunks;
+        int last_group = -1;
+
+        for (int task = atomic_fetch_add_explicit(cnt_down, 1, memory_order_relaxed); task < n_tasks;
+                 task = atomic_fetch_add_explicit(cnt_down, 1, memory_order_relaxed)) {
+            const int g = task / n_chunks;
+            const struct moe_fuse_group * gr = &groups[g];
+            const int64_t r0 = (int64_t) (task % n_chunks)*MOE_FUSE_DOWN_CHUNK;
+            const int64_t r1 = MIN(r0 + MOE_FUSE_DOWN_CHUNK, n_out);
+            const int nc = gr->n;
+
+            const void * cols[MOE_FUSE_GROUP];
+            float * dst[MOE_FUSE_GROUP];
+            for (int c = 0; c < nc; ++c) {
+                cols[c] = hq + c*row_dn;
+                dst[c]  = (float *) ((char *) down->data + gr->slot[c]*down->nb[1] + gr->tok[c]*down->nb[2]);
+            }
+            if (g != last_group) {
+                for (int c = 0; c < nc; ++c) {
+                    from_float((const float *) ((const char *) glu->data + gr->slot[c]*glu->nb[1] + gr->tok[c]*glu->nb[2]),
+                        hq + c*row_dn, n_ff);
+                }
+                last_group = g;
+            }
+            const char * d_base = (const char *) wd->data + gr->expert*wd->nb[2];
+
+            for (int64_t r = r0; r < r1; ++r) {
+                const char * d_row = d_base + r*wd->nb[1];
+#ifdef GGML_CPU_HAS_VEC_DOT_COLS
+                if (nc > 1 && cols_d != NULL) {
+                    float s[MOE_FUSE_GROUP];
+                    cols_d((int) n_ff, s, d_row, cols, nc);
+                    for (int c = 0; c < nc; ++c) {
+                        dst[c][r] = s[c];
+                    }
+                    continue;
+                }
+#endif
+                for (int c = 0; c < nc; ++c) {
+                    dot_d((int) n_ff, &dst[c][r], 0, d_row, 0, cols[c], 0, 1);
+                }
+            }
+        }
+    }
+}
+
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static int  ggml_cpu_moe_fuse = -1;
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3151,6 +3437,20 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        if (ggml_cpu_moe_fuse < 0) {
+            const char * e = getenv("GGML_MOE_FUSE");
+            ggml_cpu_moe_fuse = !(e && e[0] == '0');
+        }
+        const struct ggml_tensor * gate, * up, * glu;
+        struct ggml_tensor * down;
+        if (ggml_cpu_moe_fuse && moe_fuse_match(cgraph, node_n, &gate, &up, &glu, &down) &&
+                params->wsize >= moe_fuse_wsize(gate, down, params->nth)) {
+            ggml_compute_forward_moe_fused(params, gate, up, glu, down);
+            return 3;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
