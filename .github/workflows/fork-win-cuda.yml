@@ -1,10 +1,15 @@
-# Fork build: one Windows x64 CUDA 12.4 package, laid out like the upstream release zip
-# (CPU backends + llama-server built with clang, ggml-cuda built with MSVC/nvcc, CUDA runtime DLLs).
+# Fork build: Windows x64 CUDA 12.4 and 13.4 packages laid out like the upstream release
+# (CPU backends + llama-server built with clang, ggml-cuda built with MSVC/nvcc) and the CUDA runtime as a separate
+# archive, named as upstream names them so that LLManager installs both the same way.
+# A pushed tag fork-b<upstream build>.<n> (fork-b12110.1) publishes a release; a branch push only builds as a check.
+# Path filters are not evaluated for tag pushes.
 name: Fork Windows CUDA
 
 on:
   workflow_dispatch:
   push:
+    tags:
+      - 'fork-b*'
     branches:
       - 'perf/**'
     paths: [
@@ -78,13 +83,16 @@ jobs:
 
   windows-cuda:
     runs-on: windows-2022
+    strategy:
+      matrix:
+        cuda: ['12.4', '13.4']
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Cuda Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '12.4'
+          cuda_version: ${{ matrix.cuda }}
           cuda_arch: x64
 
       - name: Install Ninja
@@ -93,7 +101,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: fork-windows-2022-x64-cuda-12.4
+          key: fork-windows-2022-x64-cuda-${{ matrix.cuda }}
 
       - name: Build
         shell: cmd
@@ -109,20 +117,24 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
 
-      - name: Collect ggml-cuda and CUDA runtime
+      - name: Collect ggml-cuda and the CUDA runtime
         run: |
-          $dst = '.\out\'
-          New-Item -ItemType Directory -Force $dst | Out-Null
-          Copy-Item .\build\bin\Release\ggml-cuda.dll $dst
-          robocopy "${{ env.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{ env.CUDA_PATH }}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          robocopy "${{ env.CUDA_PATH }}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          New-Item -ItemType Directory -Force .\out, .\rt | Out-Null
+          Copy-Item .\build\bin\Release\ggml-cuda.dll .\out\
+          robocopy "${{ env.CUDA_PATH }}\bin" .\rt cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\lib" .\rt cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\bin\x64" .\rt cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           exit 0
 
       - uses: actions/upload-artifact@v7
         with:
-          name: cuda-bin
+          name: cuda-bin-${{ matrix.cuda }}
           path: out/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cudart-bin-${{ matrix.cuda }}
+          path: rt/*
 
   package:
     needs: [windows-cpu, windows-cuda]
@@ -133,23 +145,30 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: cpu-bin
-          path: pkg
+          path: cpu
       - uses: actions/download-artifact@v8
         with:
-          name: cuda-bin
-          path: pkg
+          pattern: cuda*-bin-*
+          path: cuda
 
-      - name: Name the package
-        id: name
-        run: echo "zip=llama-${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}-bin-win-cuda-12.4-x64" >> "$GITHUB_OUTPUT"
+      # Upstream names: llama-<tag>-bin-win-cuda-<v>-x64.zip and cudart-llama-bin-win-cuda-<v>-x64.zip.
+      - name: Pack
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then name="$GITHUB_REF_NAME"; else name="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"; fi
+          mkdir dist
+          for v in 12.4 13.4; do
+            rm -rf pkg && cp -r cpu pkg && cp cuda/cuda-bin-$v/* pkg/
+            test -f pkg/llama-server.exe && test -f pkg/ggml-cuda.dll && ls cuda/cudart-bin-$v/cudart64_*.dll
+            (cd pkg && zip -qr "../dist/llama-$name-bin-win-cuda-$v-x64.zip" .)
+            (cd cuda/cudart-bin-$v && zip -qr "../../dist/cudart-llama-bin-win-cuda-$v-x64.zip" .)
+          done
+          ls -l dist
 
-      # A public pre-release per commit: downloadable without a token.
-      - name: Publish pre-release
+      # A public release per fork-b* tag: downloadable without a token; GitHub adds the sha256 digests LLManager checks.
+      - name: Publish release
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'fork-b')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          zip="${{ steps.name.outputs.zip }}.zip"
-          (cd pkg && zip -qr "../$zip" .)
-          tag="fork-${GITHUB_SHA::7}"
-          gh release create "$tag" "$zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --prerelease --title "$tag (${GITHUB_REF_NAME})" --notes "Fork build of ${GITHUB_REF_NAME} at ${GITHUB_SHA}"
+          gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes "Fork build of $GITHUB_REF_NAME at $GITHUB_SHA (Windows x64, CUDA 12.4 and 13.4)"
