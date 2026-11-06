@@ -1739,6 +1739,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
+    mparams.requant_q8_0 = params.requant_q8_0.empty() ? nullptr : params.requant_q8_0.c_str();
+
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;

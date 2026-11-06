@@ -325,6 +325,8 @@ extern "C" {
         // NULL-terminated list of buffer types to use for tensors that match a pattern
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
+        const char * requant_q8_0; // [EXPERIMENTAL] regex of weight names converted from BF16/F16 to Q8_0 at load
+
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model

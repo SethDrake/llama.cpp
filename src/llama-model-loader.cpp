@@ -1371,9 +1371,41 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
-    GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+    // [EXPERIMENTAL] create a matching BF16/F16 matrix as Q8_0; load_all_data() converts it
+    const ggml_tensor t_meta_file = t_meta;
+    bool requant = false;
+    if (!requant_q8_0.empty() && !(flags & (TENSOR_READ_LAZY | TENSOR_DUPLICATED)) &&
+            (t_meta.type == GGML_TYPE_BF16 || t_meta.type == GGML_TYPE_F16) &&
+            ggml_n_dims(&t_meta) == 2 && t_meta.ne[0] % ggml_blck_size(GGML_TYPE_Q8_0) == 0) {
+        if (!requant_re) {
+            requant_re = std::make_unique<std::regex>(requant_q8_0);
+        }
+        if (std::regex_search(tn.str(), *requant_re)) {
+            t_meta.type = GGML_TYPE_Q8_0;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (dim == 0) {
+                    t_meta.nb[dim] = ggml_type_size(t_meta.type);
+                } else if (dim == 1) {
+                    t_meta.nb[dim] = ggml_row_size(t_meta.type, t_meta.ne[dim-1]);
+                } else {
+                    t_meta.nb[dim] = t_meta.ne[dim-1]*t_meta.nb[dim-1];
+                }
+            }
+            requant = true;
+        }
+    }
+
+    if (!requant) {
+        GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+    }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    if (requant && buft != nullptr && ggml_backend_buft_is_host(buft)) {
+        // a host tensor aliases the mapped file and cannot change its type
+        t_meta = t_meta_file;
+        requant = false;
+        buft = buft_for_tensor(&t_meta);
+    }
     if (buft == nullptr) {
         return nullptr;
     }
@@ -1399,6 +1431,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         n_created++;
     }
 
+    if (requant) {
+        requant_names.insert(tn.str());
+        requant_bytes_before += ggml_nbytes(&t_meta_file);
+        requant_bytes_after  += ggml_nbytes(&t_meta);
+        LLAMA_LOG_DEBUG("%s: tensor %s will be converted from %s to %s\n", __func__, tn.str().c_str(),
+            ggml_type_name(t_meta_file.type), ggml_type_name(t_meta.type));
+    }
+
     return tensor;
 }
 
@@ -1412,6 +1452,10 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
+    }
+    if (!requant_names.empty()) {
+        LLAMA_LOG_INFO("%s: %zu tensors converted to Q8_0 at load (%.2f MiB -> %.2f MiB)\n", __func__,
+            requant_names.size(), requant_bytes_before / 1024.0 / 1024.0, requant_bytes_after / 1024.0 / 1024.0);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1695,6 +1739,10 @@ bool llama_model_loader::load_all_data(
 
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     std::vector<no_init<uint8_t>> read_buf;
+    // buffers for the BF16/F16 -> Q8_0 conversion, reused across tensors
+    std::vector<uint8_t> requant_src;
+    std::vector<float>   requant_f32;
+    std::vector<uint8_t> requant_dst;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1709,6 +1757,32 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (!requant_names.empty() && requant_names.count(ggml_get_name(cur))) {
+            // [EXPERIMENTAL] the tensor was created as Q8_0, the file holds BF16/F16
+            GGML_ASSERT(cur->data != nullptr);
+            const ggml_tensor * src = weight->tensor;
+            const size_t src_size = ggml_nbytes(src);
+            if (!use_mmap) {
+                requant_src.resize(src_size);
+            }
+            const void * src_data = load_data_range(*weight, 0, src_size, requant_src.data());
+
+            const int64_t ne0   = src->ne[0];
+            const int64_t nrows = src->ne[1];
+            requant_f32.resize(ne0*nrows);
+            if (src->type == GGML_TYPE_BF16) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) src_data, requant_f32.data(), ne0*nrows);
+            } else {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) src_data, requant_f32.data(), ne0*nrows);
+            }
+            requant_dst.resize(n_size);
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, requant_f32.data(), requant_dst.data(), 0, nrows, ne0, nullptr);
+            ggml_backend_tensor_set(cur, requant_dst.data(), 0, n_size);
+
+            size_done += src_size; // size_data counts the bytes of the file
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
