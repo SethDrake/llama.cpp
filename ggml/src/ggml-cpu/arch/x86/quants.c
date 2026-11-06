@@ -2806,6 +2806,45 @@ static GGML_X86_FORCE_INLINE __m256i iq_gather4_u64_avx2(
     return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 }
 
+// Block scale 2*n+1 (n = 0..15) as a 16 x epi16 vector, read as a memory operand of vpmaddwd.
+static const int16_t iq_scale_tab_avx2[16][16] = {
+    {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
+    {3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3},
+    {5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5},
+    {7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7},
+    {9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9},
+    {11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11},
+    {13,13,13,13,13,13,13,13,13,13,13,13,13,13,13,13},
+    {15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15},
+    {17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17},
+    {19,19,19,19,19,19,19,19,19,19,19,19,19,19,19,19},
+    {21,21,21,21,21,21,21,21,21,21,21,21,21,21,21,21},
+    {23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23},
+    {25,25,25,25,25,25,25,25,25,25,25,25,25,25,25,25},
+    {27,27,27,27,27,27,27,27,27,27,27,27,27,27,27,27},
+    {29,29,29,29,29,29,29,29,29,29,29,29,29,29,29,29},
+    {31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31},
+};
+
+// +-1 sign bytes of two 32-weight sub-blocks from 4 x 7 sign bits each. t holds the 32-bit sign words as
+// [w0,w0,w1,w1 | w0,w0,w1,w1]; w0 gives s1, w1 gives s2. The eighth sign bit is the parity of the seven.
+static GGML_X86_FORCE_INLINE void iq_signs_avx2(const __m256i t, __m256i * s1, __m256i * s2) {
+    const __m256i x = _mm256_and_si256(_mm256_srlv_epi32(t, _mm256_setr_epi32(0, 7, 0, 7, 14, 21, 14, 21)), _mm256_set1_epi32(127));
+    const __m256i lut = _mm256_setr_epi8(
+            0, (char)0x80, (char)0x80, 0, (char)0x80, 0, 0, (char)0x80, (char)0x80, 0, 0, (char)0x80, 0, (char)0x80, (char)0x80, 0,
+            0, (char)0x80, (char)0x80, 0, (char)0x80, 0, 0, (char)0x80, (char)0x80, 0, 0, (char)0x80, 0, (char)0x80, (char)0x80, 0);
+    const __m256i b = _mm256_or_si256(x, _mm256_shuffle_epi8(lut, _mm256_xor_si256(x, _mm256_srli_epi32(x, 4))));
+    const __m256i eA = _mm256_shuffle_epi8(b, _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4,
+                                                               0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4));
+    const __m256i eB = _mm256_shuffle_epi8(b, _mm256_setr_epi8(8, 8, 8, 8, 8, 8, 8, 8, 12, 12, 12, 12, 12, 12, 12, 12,
+                                                               8, 8, 8, 8, 8, 8, 8, 8, 12, 12, 12, 12, 12, 12, 12, 12));
+    const __m256i bits = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)128, 1, 2, 4, 8, 16, 32, 64, (char)128,
+                                          1, 2, 4, 8, 16, 32, 64, (char)128, 1, 2, 4, 8, 16, 32, 64, (char)128);
+    const __m256i one = _mm256_set1_epi8(1);
+    *s1 = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(eA, bits), bits), one);
+    *s2 = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(eB, bits), bits), one);
+}
+
 // One IQ2_XXS row against NC Q8_K columns: grid lookups, sign masks and scales are decoded once per
 // 64 weights and applied to every column. The grid and sign indices are taken from 64-bit loads of the
 // quants instead of byte loads. With NC == 1 this is the single-row kernel.
@@ -2827,6 +2866,7 @@ static GGML_X86_FORCE_INLINE void iq2_xxs_q8_K_cols(
             sumi1[c] = _mm256_setzero_si256();
             sumi2[c] = _mm256_setzero_si256();
         }
+GGML_IQ_UNROLL
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
             uint64_t A, B;
             memcpy(&A, q2, 8);
@@ -2840,8 +2880,9 @@ static GGML_X86_FORCE_INLINE void iq2_xxs_q8_K_cols(
                                                      &signs64[(A >> 46) & 127], &signs64[(A >> 53) & 127]);
             const __m256i s2_2 = iq_gather4_u64_avx2(&signs64[(B >> 32) & 127], &signs64[(B >> 39) & 127],
                                                      &signs64[(B >> 46) & 127], &signs64[(B >> 53) & 127]);
-            const __m256i sc1 = _mm256_set1_epi16(2*(int)(A >> 60) + 1);
-            const __m256i sc2 = _mm256_set1_epi16(2*(int)(B >> 60) + 1);
+            const __m256i sc1 = _mm256_loadu_si256((const __m256i *)iq_scale_tab_avx2[A >> 60]);
+            const __m256i sc2 = _mm256_loadu_si256((const __m256i *)iq_scale_tab_avx2[B >> 60]);
+GGML_IQ_UNROLL
             for (int c = 0; c < NC; ++c) {
                 const int8_t * GGML_RESTRICT q8 = ys[c][i].qs + ib32*32;
                 const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
@@ -3546,6 +3587,59 @@ static void ggml_vec_dot_iq2_s_q8_K_cols(int n, float * GGML_RESTRICT s, const v
 #endif
 
 #if defined(__AVX2__)
+// One IQ3_XXS row against one Q8_K column. The grid values are blended in from byte-load indices and the sign
+// vectors are built with vector shifts and a parity lookup instead of table loads.
+static GGML_X86_FORCE_INLINE void iq3_xxs_q8_K_1col(
+        const int nb, float * GGML_RESTRICT s, const block_iq3_xxs * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y) {
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        const uint8_t * GGML_RESTRICT q3 = x[i].qs;
+        const uint8_t * GGML_RESTRICT gas = x[i].qs + QK_K/4;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+GGML_IQ_UNROLL
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            __m256i q2_1 = _mm256_castsi128_si256(_mm_cvtsi32_si128((int)iq3xxs_grid[q3[0]]));
+            __m256i q2_2 = _mm256_castsi128_si256(_mm_cvtsi32_si128((int)iq3xxs_grid[q3[8]]));
+            q2_1 = _mm256_blend_epi32(q2_1, _mm256_set1_epi32((int)iq3xxs_grid[q3[1]]), 0x02);
+            q2_2 = _mm256_blend_epi32(q2_2, _mm256_set1_epi32((int)iq3xxs_grid[q3[9]]), 0x02);
+            q2_1 = _mm256_blend_epi32(q2_1, _mm256_set1_epi32((int)iq3xxs_grid[q3[2]]), 0x04);
+            q2_2 = _mm256_blend_epi32(q2_2, _mm256_set1_epi32((int)iq3xxs_grid[q3[10]]), 0x04);
+            q2_1 = _mm256_blend_epi32(q2_1, _mm256_set1_epi32((int)iq3xxs_grid[q3[3]]), 0x08);
+            q2_2 = _mm256_blend_epi32(q2_2, _mm256_set1_epi32((int)iq3xxs_grid[q3[11]]), 0x08);
+            q2_1 = _mm256_blend_epi32(q2_1, _mm256_set1_epi32((int)iq3xxs_grid[q3[4]]), 0x10);
+            q2_2 = _mm256_blend_epi32(q2_2, _mm256_set1_epi32((int)iq3xxs_grid[q3[12]]), 0x10);
+            q2_1 = _mm256_blend_epi32(q2_1, _mm256_set1_epi32((int)iq3xxs_grid[q3[5]]), 0x20);
+            q2_2 = _mm256_blend_epi32(q2_2, _mm256_set1_epi32((int)iq3xxs_grid[q3[13]]), 0x20);
+            q2_1 = _mm256_blend_epi32(q2_1, _mm256_set1_epi32((int)iq3xxs_grid[q3[6]]), 0x40);
+            q2_2 = _mm256_blend_epi32(q2_2, _mm256_set1_epi32((int)iq3xxs_grid[q3[14]]), 0x40);
+            q2_1 = _mm256_blend_epi32(q2_1, _mm256_set1_epi32((int)iq3xxs_grid[q3[7]]), 0x80);
+            q2_2 = _mm256_blend_epi32(q2_2, _mm256_set1_epi32((int)iq3xxs_grid[q3[15]]), 0x80);
+            q3 += 16;
+            uint32_t aux32[2];
+            memcpy(aux32, gas, 8); gas += 8;
+            const __m256i bq = _mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i *)aux32));
+            __m256i s2_1, s2_2;
+            iq_signs_avx2(_mm256_unpacklo_epi32(bq, bq), &s2_1, &s2_2);
+            const __m256i sc1 = _mm256_loadu_si256((const __m256i *)iq_scale_tab_avx2[aux32[0] >> 28]);
+            const __m256i sc2 = _mm256_loadu_si256((const __m256i *)iq_scale_tab_avx2[aux32[1] >> 28]);
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+            q8 += 64;
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, _mm256_sign_epi8(q8_1, s2_1));
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, _mm256_sign_epi8(q8_2, s2_2));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, sc1));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, sc2));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    *s = 0.25f * hsum_float_8(accumf);
+}
+#endif
+
+#if defined(__AVX2__)
 // One IQ3_XXS row against NC Q8_K columns. The grid lookups, the sign masks and the block scales are
 // decoded once per 64 weights and applied to every column. The grid indices are taken from 64-bit loads
 // of the quants and the sign vectors are built with movq + movhps. With NC == 1 this is the single-row
@@ -3624,8 +3718,7 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
     const int nb = n / QK_K;
 
 #if defined(__AVX2__)
-    const block_q8_K * ys[1] = { y };
-    iq3_xxs_q8_K_cols(nb, s, x, ys, 1);
+    iq3_xxs_q8_K_1col(nb, s, x, y);
 #elif defined(__AVX__)
     const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
 
@@ -3699,7 +3792,7 @@ static void ggml_vec_dot_iq3_xxs_q8_K_cols(int n, float * GGML_RESTRICT s, const
     const block_iq3_xxs * GGML_RESTRICT x = vx;
     const block_q8_K * const * ys = (const block_q8_K * const *) vy;
     switch (ncols) {
-        case 1:  iq3_xxs_q8_K_cols(nb, s, x, ys, 1); break;
+        case 1:  iq3_xxs_q8_K_1col(nb, s, x, ys[0]); break;
         case 2:  iq3_xxs_q8_K_cols(nb, s, x, ys, 2); break;
         case 3:  iq3_xxs_q8_K_cols(nb, s, x, ys, 3); break;
         default: iq3_xxs_q8_K_cols(nb, s, x, ys, 4); break;
