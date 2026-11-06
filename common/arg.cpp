@@ -2746,6 +2746,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--moe-tail-skip"}, "N",
+        string_format("skip the MoE cache misses that every token of the batch selects at rank N or later (0-based, by router score): "
+            "they are neither uploaded nor computed and contribute zero; needs --moe-cache-cpu-share > 0; changes the output slightly, 0 = off (default: %d)", params.moe_tail_skip),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_tail_skip = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TAIL_SKIP"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
