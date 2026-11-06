@@ -12,9 +12,12 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <regex>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -124,6 +127,13 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+
+    // [EXPERIMENTAL] BF16/F16 weights whose names match this regex are created as Q8_0 and converted while loading
+    std::string requant_q8_0;
+    std::unordered_set<std::string> requant_names;
+    std::unique_ptr<std::regex> requant_re; // compiled lazily from requant_q8_0
+    size_t requant_bytes_before = 0;
+    size_t requant_bytes_after  = 0;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set

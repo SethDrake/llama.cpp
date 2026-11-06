@@ -2746,6 +2746,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--requant-q8-0"}, "REGEX",
+        "convert BF16/F16 weights whose names match REGEX to Q8_0 while loading (experimental)",
+        [](common_params & params, const std::string & value) {
+            params.requant_q8_0 = value;
+        }
+    ).set_env("LLAMA_ARG_REQUANT_Q8_0"));
+    add_opt(common_arg(
         {"--moe-tail-skip"}, "N",
         string_format("skip the MoE cache misses that every token of the batch selects at rank N or later (0-based, by router score): "
             "they are neither uploaded nor computed and contribute zero; needs --moe-cache-cpu-share > 0; changes the output slightly, 0 = off (default: %d)", params.moe_tail_skip),
