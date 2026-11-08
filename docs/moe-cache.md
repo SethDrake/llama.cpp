@@ -27,3 +27,10 @@ From these runs it fits the upload and CPU speeds of the machine, then replays t
 - **Server command:** keep your own arguments (`-t`, `-c`, expert placement, load mode); the speeds and the free device memory depend on them.
 - **`--max-mib N`:** tunes a smaller cache than what fits on the device. The runs in `--out` are reused while the command stays the same, so trying another value is instant.
 - **`--markdown`:** prints Markdown tables to paste in a PR.
+
+## Profiling
+
+Two environment variables print host timings when the server exits cleanly (with `--log-verbosity 4`):
+
+- **`LLAMA_MOE_CACHE_TIMING=1`:** the copy callback of the cache for single-token batches: reading the selected experts and the CPU part inputs (`pre`), waiting for the device, the cache policy, the uploads and the slot map copy.
+- **`GGML_SCHED_TIMING=1`:** per decode graph, the time spent copying split inputs (waits for the other backend included) and computing device and CPU splits; it also prints the split layout of one decode graph.

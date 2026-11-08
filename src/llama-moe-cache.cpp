@@ -458,6 +458,13 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
 
+    // host time of the copy callback for small ubatches, LLAMA_MOE_CACHE_TIMING=1 (profiling)
+    struct timing {
+        int64_t pre = 0, sync = 0, plan = 0, upload = 0, tail = 0, cpu_in = 0;
+        size_t  calls = 0, cpu_in_calls = 0;
+    } tm;
+    const bool timing_on = getenv("LLAMA_MOE_CACHE_TIMING") != nullptr;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -845,8 +852,16 @@ struct llama_moe_cache::impl {
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
-            return copy_cpu_input(src, dst);
+            if (!timing_on) {
+                return copy_cpu_input(src, dst);
+            }
+            const int64_t c0 = ggml_time_us();
+            const bool res = copy_cpu_input(src, dst);
+            tm.cpu_in += ggml_time_us() - c0;
+            tm.cpu_in_calls++;
+            return res;
         }
+        const int64_t t0 = timing_on ? ggml_time_us() : 0;
         const int32_t il = it->second;
         layer & l = layers[il];
         group & g = groups[l.ig];
@@ -914,7 +929,9 @@ struct llama_moe_cache::impl {
 
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        const int64_t t1 = timing_on ? ggml_time_us() : 0;
         ggml_backend_synchronize(backend);
+        const int64_t t2 = timing_on ? ggml_time_us() : 0;
 
         if (trace != nullptr) {
             write_trace(il, it_cpu != cpu_parts.end() ? it_cpu->second.n_used : n_expert_used);
@@ -945,6 +962,8 @@ struct llama_moe_cache::impl {
             }
         }
 
+        const int64_t t3 = timing_on ? ggml_time_us() : 0;
+
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -962,6 +981,8 @@ struct llama_moe_cache::impl {
             }
         }
 
+        const int64_t t4 = timing_on ? ggml_time_us() : 0;
+
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size() + cpu.size() + n_skip;
@@ -971,6 +992,12 @@ struct llama_moe_cache::impl {
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+
+        if (timing_on && &st == &stats_small) {
+            const int64_t t5 = ggml_time_us();
+            tm.pre += t1 - t0; tm.sync += t2 - t1; tm.plan += t3 - t2; tm.upload += t4 - t3; tm.tail += t5 - t4;
+            tm.calls++;
+        }
 
         return true;
     }
@@ -985,6 +1012,11 @@ struct llama_moe_cache::impl {
                 name, st.hits, st.misses, st.cpu, st.skip, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
         };
         log("ubatch <= 8", stats_small);
+        if (timing_on && tm.calls > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: timing (ubatch <= 8): %zu calls, ms total: pre %.1f, sync %.1f, plan %.1f, upload %.1f, tail %.1f; "
+                "CPU inputs %zu calls %.1f ms\n", tm.calls, tm.pre/1e3, tm.sync/1e3, tm.plan/1e3, tm.upload/1e3, tm.tail/1e3,
+                tm.cpu_in_calls, tm.cpu_in/1e3);
+        }
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);

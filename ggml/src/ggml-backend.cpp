@@ -1246,6 +1246,13 @@ struct ggml_backend_sched {
     int prev_graph_size;
 
     int debug_realloc;
+
+    // GGML_SCHED_TIMING=1 (profiling): host time per split kind of graphs computed in under 200 ms (decode),
+    // [0] device splits, [1] CPU splits; inputs = copying the split inputs (waits for the producing backend included)
+    bool    tm_on;
+    int64_t tm_in[2], tm_comp[2], tm_total;
+    int64_t tm_graphs, tm_splits[2];
+    bool    tm_dumped;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2128,10 +2135,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    int64_t tm_in[2] = {0, 0}, tm_comp[2] = {0, 0}, tm_n[2] = {0, 0};
+    const int64_t tm_start = sched->tm_on ? ggml_time_us() : 0;
+    // one decode graph's split layout, for reading the timing
+    const bool tm_dump = sched->tm_on && !sched->tm_dumped && sched->tm_graphs == 200;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int tm_k = sched->tm_on && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU ? 1 : 0;
+        const int64_t tm_t0 = sched->tm_on ? ggml_time_us() : 0;
+        if (tm_dump) {
+            GGML_LOG_INFO("sched split %d: %s, %d inputs, %d nodes, first %s (%s), last %s (%s)\n", split_id, ggml_backend_name(split_backend),
+                split->n_inputs, split->graph.n_nodes,
+                split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "-", split->graph.n_nodes > 0 ? ggml_op_desc(split->graph.nodes[0]) : "-",
+                split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1]->name : "-",
+                split->graph.n_nodes > 0 ? ggml_op_desc(split->graph.nodes[split->graph.n_nodes - 1]) : "-");
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2155,6 +2176,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+
+        const int64_t tm_t1 = sched->tm_on ? ggml_time_us() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2200,7 +2223,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        if (sched->tm_on) {
+            const int64_t tm_t2 = ggml_time_us();
+            tm_in[tm_k]   += tm_t1 - tm_t0;
+            tm_comp[tm_k] += tm_t2 - tm_t1;
+            tm_n[tm_k]++;
+        }
+
         prev_backend_id = split_backend_id;
+    }
+
+    if (sched->tm_on) {
+        const int64_t total = ggml_time_us() - tm_start;
+        if (tm_dump) {
+            sched->tm_dumped = true;
+        }
+        if (total < 200000) {
+            for (int k = 0; k < 2; k++) {
+                sched->tm_in[k]     += tm_in[k];
+                sched->tm_comp[k]   += tm_comp[k];
+                sched->tm_splits[k] += tm_n[k];
+            }
+            sched->tm_total += total;
+            sched->tm_graphs++;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2228,6 +2274,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+    sched->tm_on = getenv("GGML_SCHED_TIMING") != NULL; // calloc zeroed the counters
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
@@ -2281,6 +2328,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->tm_on && sched->tm_graphs > 0) {
+        const double g = (double) sched->tm_graphs * 1e3;
+        GGML_LOG_INFO("sched timing: %lld graphs under 200 ms, ms per graph: compute_splits %.2f; device splits %.1f/graph: inputs %.2f, launch %.2f; "
+            "CPU splits %.1f/graph: inputs %.2f, compute %.2f\n", (long long) sched->tm_graphs, sched->tm_total/g,
+            (double) sched->tm_splits[0]/sched->tm_graphs, sched->tm_in[0]/g, sched->tm_comp[0]/g,
+            (double) sched->tm_splits[1]/sched->tm_graphs, sched->tm_in[1]/g, sched->tm_comp[1]/g);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
