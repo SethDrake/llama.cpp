@@ -133,10 +133,18 @@ def full_mib(trace, share):
     return math.ceil(res / 2**20) + 1
 
 
+LFU_WINDOW_SLOTS = 10  # moe_cache_slru::lfu_window_slots
+LFU_MARGIN = 2         # moe_cache_slru::lfu_margin
+
+
 class SLRU:
     """moe_cache_slru"""
 
-    def __init__(self, layers, n_expert, n_slots):
+    def __init__(self, layers, n_expert, n_slots, lfu=False):
+        self.lfu = lfu
+        self.cnt = {}
+        self.lfu_window = n_slots * LFU_WINDOW_SLOTS
+        self.lfu_n_inc = 0
         self.n_expert = n_expert
         self.n_slots = n_slots
         self.slot_map = {il: [n_slots] * n_expert for il in layers}
@@ -190,6 +198,30 @@ class SLRU:
                 s = self.next[s]
         raise RuntimeError("no SLRU victim")
 
+    def victim_lfu(self, il):
+        n_expert, key_of, seen, gen, cnt = self.n_expert, self.key_of, self.seen, self.seen_gen, self.cnt
+        res, lo = -1, None
+        for s in range(self.n_slots):
+            key = key_of[s]
+            if key // n_expert == il and seen[key % n_expert] == gen:
+                continue
+            c = cnt.get(key, 0)
+            if lo is None or c < lo:
+                res, lo = s, c
+                if c == 0:
+                    break
+        return res
+
+    def put(self, il, e, s):
+        key = self.key_of[s]
+        if key >= 0:
+            self.slot_map[key // self.n_expert][key % self.n_expert] = self.n_slots
+        else:
+            self.n_filled += 1
+        self.key_of[s] = il * self.n_expert + e
+        self.slot_map[il][e] = s
+        self.move(s, False)
+
     def plan(self, il, ids, n_used, n_zero, n_cpu, rng):
         """returns (uploaded, computed on the CPU, rng)"""
         self.seen_gen += 1
@@ -204,12 +236,59 @@ class SLRU:
 
         slots = self.slot_map[il]
         n_slots = self.n_slots
+        if self.lfu:
+            cnt = self.cnt
+            for e in uniq:
+                k = il * self.n_expert + e
+                cnt[k] = min(cnt.get(k, 0) + 1, 0xFFFF)
+            self.lfu_n_inc += len(uniq)
+            if self.lfu_n_inc >= self.lfu_window:
+                self.lfu_n_inc = 0
+                self.cnt = cnt = {k: v >> 1 for k, v in cnt.items() if v > 1}
         misses = []
         for e in uniq:
             if slots[e] < n_slots:
-                self.touch(slots[e])
+                if not self.lfu:
+                    self.touch(slots[e])
             else:
                 misses.append(e)
+
+        n_tokens = len(ids) // n_used
+        token_zero = [0] * n_tokens
+
+        def take_zero(e):
+            toks = [it for it in range(n_tokens) if e in ids[it * n_used:(it + 1) * n_used]]
+            used = 0
+            for it in toks:
+                used |= token_zero[it]
+            z = ((~used) & (used + 1)).bit_length() - 1
+            if z >= n_zero:
+                return False
+            for it in toks:
+                token_zero[it] |= 1 << z
+            slots[e] = n_slots + z
+            return True
+
+        if self.lfu and n_zero > 0 and n_used > 1 and self.n_filled == n_slots:
+            base = il * self.n_expert
+            c = lambda e: self.cnt.get(base + e, 0)
+            misses.sort(key=lambda e: (-c(e), e))
+            i, n_up, n_cpu_done = 0, 0, 0
+            while i < len(misses):
+                s = self.victim_lfu(il)
+                if s < 0 or c(misses[i]) <= self.cnt.get(self.key_of[s], 0) + LFU_MARGIN:
+                    break
+                self.put(il, misses[i], s)
+                n_up += 1
+                i += 1
+            for e in misses[i:]:
+                if take_zero(e):
+                    n_cpu_done += 1
+                    continue
+                s = self.victim_lfu(il)
+                self.put(il, e, s if s >= 0 else self.victim(il))
+                n_up += 1
+            return n_up, n_cpu_done, rng
 
         n_c = min(n_cpu(len(misses)), len(misses))
         for i in range(n_c):
@@ -255,7 +334,7 @@ class SLRU:
         return len(misses), n_cpu_done, rng
 
 
-def replay(trace, size_mib, share, skip_tokens):
+def replay(trace, size_mib, share, skip_tokens, lfu=False):
     """GiB of experts uploaded and computed on the CPU per token, after skip_tokens"""
     n_layer, n_expert_used, groups, records = trace
     share = f32(share)
@@ -264,7 +343,7 @@ def replay(trace, size_mib, share, skip_tokens):
     caches, group_of = [], {}
     for ig, g in enumerate(groups):
         n = n_slots_of(g, size_mib, n_zero, n_expert_used)
-        caches.append(SLRU(g.layers, g.n_expert, n) if n > 0 else None)
+        caches.append(SLRU(g.layers, g.n_expert, n, lfu and share > 0.0) if n > 0 else None)
         group_of.update((il, ig) for il in g.layers)
 
     first = min(il for il, _, _ in records)

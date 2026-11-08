@@ -43,10 +43,26 @@ struct moe_cache_slru {
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
 
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+    // LFU with decay: use counts of every expert, halved after lfu_window lookups so that they follow the recent routing
+    // (the routing of a MoE model changes within a few tokens, a long-term profile predicts it poorly)
+    // once the cache is full, a miss is uploaded only if it beats the least used expert not selected now by lfu_margin,
+    // the other misses are computed on the CPU
+    static constexpr int32_t lfu_window_slots = 10; // decay period in lookups per slot, ~10 tokens for 1/50 of the experts
+    static constexpr int32_t lfu_margin       = 2;  // count lead an upload needs: an upload costs ~2x a CPU computation
+    bool lfu = false;
+    std::vector<uint16_t> cnt; // [n_layer*n_expert]
+    uint32_t lfu_window = 0;
+    uint32_t lfu_n_inc  = 0;
+
+    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, bool lfu) {
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
         this->empty    = n_slots;
+        this->lfu      = lfu;
+        if (lfu) {
+            cnt.assign((size_t) n_layer*n_expert, 0);
+            lfu_window = (uint32_t) n_slots*lfu_window_slots;
+        }
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
         prev.resize(n_slots);
@@ -110,6 +126,40 @@ struct moe_cache_slru {
         GGML_ABORT("no SLRU victim");
     }
 
+    // the least used expert of a full cache that is not selected in layer il now, -1 if every slot is
+    int32_t victim_lfu(int32_t il) const {
+        int32_t  res = -1;
+        uint32_t min = UINT32_MAX;
+        for (int32_t s = 0; s < n_slots; ++s) {
+            const int32_t key = key_of[s];
+            if (key / n_expert == il && seen[key % n_expert] == seen_gen) {
+                continue;
+            }
+            if (cnt[key] < min) {
+                min = cnt[key];
+                res = s;
+                if (min == 0) {
+                    break;
+                }
+            }
+        }
+        return res;
+    }
+
+    void lfu_count(int32_t il) {
+        for (int32_t e : uniq) {
+            uint16_t & c = cnt[(size_t) il*n_expert + e];
+            c += c < UINT16_MAX;
+        }
+        lfu_n_inc += uniq.size();
+        if (lfu_n_inc >= lfu_window) {
+            lfu_n_inc = 0;
+            for (uint16_t & c : cnt) {
+                c >>= 1;
+            }
+        }
+    }
+
     struct fill {
         int32_t expert;
         int32_t slot;
@@ -120,9 +170,10 @@ struct moe_cache_slru {
     // a zero slot is used at most once per token, a miss that does not get one is cached instead
     // with tail_rank > 0, a miss that every token selects at rank tail_rank or later (ids are sorted by rank) also reads a
     // zero slot but is neither uploaded nor computed: it contributes zero, the other experts keep their weights
+    // with lfu and has_cpu, n_cpu is not used: once the cache is full, the misses that do not win a slot go to the CPU
     // returns false if the ids select more distinct experts than there are slots
     template <typename F>
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int32_t n_used, int32_t n_zero, F && n_cpu, uint64_t & rng,
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int32_t n_used, int32_t n_zero, bool has_cpu, F && n_cpu, uint64_t & rng,
             int32_t tail_rank, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, size_t & n_skip) {
         fills.clear();
         cpu.clear();
@@ -146,12 +197,17 @@ struct moe_cache_slru {
         }
 
         int32_t * slots = slot_map[il];
+        if (lfu) {
+            lfu_count(il);
+        }
 
         // promote hits before choosing victims for misses
         misses.clear();
         for (int32_t e : uniq) {
             if (slots[e] < n_slots) {
-                touch(slots[e]);
+                if (!lfu) {
+                    touch(slots[e]);
+                }
                 n_hit++;
             } else {
                 misses.push_back(e);
@@ -207,6 +263,45 @@ struct moe_cache_slru {
             misses.resize(n_keep);
         }
 
+        // puts expert e into slot s, evicting its expert
+        auto put = [&](int32_t e, int32_t s) {
+            if (key_of[s] >= 0) {
+                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
+            } else {
+                n_filled++;
+            }
+            key_of[s] = il*n_expert + e;
+            slots[e] = s;
+            move(s, false);
+            fills.push_back({ e, s });
+        };
+
+        if (lfu && has_cpu && n_zero > 0 && n_filled == n_slots) {
+            // the most used misses take the slots of less used experts, the others are computed on the CPU
+            const uint16_t * c = cnt.data() + (size_t) il*n_expert;
+            std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) { return c[a] != c[b] ? c[a] > c[b] : a < b; });
+            size_t i = 0;
+            for (; i < misses.size(); ++i) {
+                const int32_t s = victim_lfu(il);
+                if (s < 0 || c[misses[i]] <= cnt[key_of[s]] + lfu_margin) {
+                    break; // the misses are sorted, the rest lose too
+                }
+                put(misses[i], s);
+            }
+            for (; i < misses.size(); ++i) {
+                const int32_t e = misses[i];
+                const int32_t s = take_zero(e);
+                if (s >= 0) {
+                    cpu.push_back({ e, s });
+                    continue;
+                }
+                // no zero slot left for one of its tokens: upload it anyway
+                const int32_t v = victim_lfu(il);
+                put(e, v >= 0 ? v : victim(il));
+            }
+            return true;
+        }
+
         // the misses left to the CPU are picked at random, so that every expert can enter the cache
         const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
         for (size_t i = 0; i < n_c; ++i) {
@@ -231,16 +326,7 @@ struct moe_cache_slru {
         // sorted misses usually get consecutive slots, so the uploads can be merged
         std::sort(misses.begin(), misses.end());
         for (int32_t e : misses) {
-            const int32_t s = victim(il);
-            if (key_of[s] >= 0) {
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = empty;
-            } else {
-                n_filled++;
-            }
-            key_of[s] = il*n_expert + e;
-            slots[e] = s;
-            move(s, false);
-            fills.push_back({ e, s });
+            put(e, victim(il));
         }
         return true;
     }
@@ -353,6 +439,7 @@ struct llama_moe_cache::impl {
 
     float    cpu_share = 0.0f;
     int32_t  tail_rank = 0;   // misses selected only at this rank or later are skipped, 0 = off
+    bool     lfu       = false; // LFU replacement instead of SLRU with random CPU misses
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
     int32_t  n_zero    = 0; // zero slots per group
     uint64_t rng       = 0x853c49e6748fea9bull;
@@ -379,9 +466,13 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, int32_t policy) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)),
-            tail_rank(std::max(tail_rank, 0)) {
+            tail_rank(std::max(tail_rank, 0)), lfu(policy == 1) {
+        if (lfu && this->cpu_share <= 0.0f) {
+            LLAMA_LOG_WARN("%s: the LFU MoE cache policy needs a CPU share > 0, using SLRU\n", __func__);
+            lfu = false;
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -495,7 +586,7 @@ struct llama_moe_cache::impl {
                 g.n_slots = 0;
                 continue;
             }
-            g.slru.init(model.layers.size(), n_expert, g.n_slots);
+            g.slru.init(model.layers.size(), n_expert, g.n_slots, lfu);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 2 : 1); // slot map and CPU map
         }
@@ -601,8 +692,13 @@ struct llama_moe_cache::impl {
             if (d.host_bytes == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %.0f%% of the misses on the CPU\n", __func__,
-                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, 100.0*cpu_share);
+            if (lfu) {
+                LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, LFU, misses that lose to the cached experts on the CPU\n", __func__,
+                    ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0);
+            } else {
+                LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %.0f%% of the misses on the CPU\n", __func__,
+                    ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, 100.0*cpu_share);
+            }
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
@@ -833,7 +929,7 @@ struct llama_moe_cache::impl {
         };
         size_t n_hit  = 0;
         size_t n_skip = 0;
-        if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, n_cpu, rng,
+        if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, has_cpu, n_cpu, rng,
                 has_cpu ? tail_rank : 0, fills, cpu, n_hit, n_skip)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
@@ -896,8 +992,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, tail_rank)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, int32_t policy) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, tail_rank, policy)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

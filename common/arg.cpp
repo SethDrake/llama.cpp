@@ -2764,6 +2764,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_TAIL_SKIP"));
     add_opt(common_arg(
+        {"--moe-cache-policy"}, "{slru,lfu}",
+        "MoE cache replacement: slru = segmented LRU, the misses left to the GPU by --moe-cache-cpu-share are picked at random; "
+            "lfu = use counts with decay, a miss is uploaded only if it is used more often than the expert it evicts, the others are "
+            "computed on the CPU; lfu needs --moe-cache-cpu-share > 0 and ignores its value (default: slru)",
+        [](common_params & params, const std::string & value) {
+            if (value == "slru") {
+                params.moe_cache_policy = 0;
+            } else if (value == "lfu") {
+                params.moe_cache_policy = 1;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_POLICY"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
