@@ -45,6 +45,7 @@ def pad(x, n):
 # routing trace (LLAMA_MOE_CACHE_TRACE)
 
 class Group:
+    dev: int
     n_expert: int
     layers: list
     split: float
@@ -73,7 +74,7 @@ def read_trace(path):
     groups = []
     for _ in range(n_group):
         g = Group()
-        _, g.n_expert, n_layers = take("3I")
+        g.dev, g.n_expert, n_layers = take("3I")
         g.layers = list(take(f"{n_layers}I"))
         g.split, g.split_sum = take("2d")
         g.host_bytes, g.dev_host_bytes, g.alignment = take("3Q")
@@ -104,22 +105,43 @@ def trace_tokens(trace):
 
 # cache simulation, mirrors src/llama-moe-cache.cpp
 
-def n_slots_of(g, size_mib, n_zero, n_expert_used):
-    budget = int(float(size_mib * 1024 * 1024) * g.split / g.split_sum * float(g.host_bytes) / float(g.dev_host_bytes))
+def group_slots(groups, size_mib, n_zero, n_expert_used):
+    """slots of each group; a group whose share cannot hold the experts of one token is not cached and its share goes
+    to the other groups (and devices)"""
+    active = [True] * len(groups)
+    slots = [0] * len(groups)
+    changed = True
+    while changed:
+        changed = False
+        active_bytes, dev_split = {}, {}
+        for g, a in zip(groups, active):
+            if a:
+                active_bytes[g.dev] = active_bytes.get(g.dev, 0) + g.host_bytes
+                dev_split[g.dev] = g.split
+        active_split = sum(dev_split.values())
+        for i, g in enumerate(groups):
+            slots[i] = 0
+            if not active[i]:
+                continue
+            budget = int(float(size_mib * 1024 * 1024) * g.split / active_split * float(g.host_bytes) / float(active_bytes[g.dev]))
 
-    def alloc(n):
-        return sum(pad(nb2 * (n + n_zero + 1), g.alignment) for nb2 in g.nb2)
+            def alloc(n):
+                return sum(pad(nb2 * (n + n_zero + 1), g.alignment) for nb2 in g.nb2)
 
-    if alloc(0) > budget:
-        return 0
-    lo, hi = 0, len(g.layers) * g.n_expert
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if alloc(mid) <= budget:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo if lo >= n_expert_used else 0
+            lo, hi = 0, len(g.layers) * g.n_expert
+            if alloc(0) > budget:
+                hi = 0
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if alloc(mid) <= budget:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            slots[i] = lo
+            if lo < n_expert_used:
+                active[i] = False
+                changed = True
+    return [n if a else 0 for n, a in zip(slots, active)]
 
 
 def full_mib(trace, share):
@@ -341,8 +363,7 @@ def replay(trace, size_mib, share, skip_tokens, lfu=False):
     share_q = int(math.floor(f32(share * 65536.0) + 0.5))  # std::lround(cpu_share*65536.0f)
     n_zero = min(n_expert_used, 64) if share > 0.0 else 0
     caches, group_of = [], {}
-    for ig, g in enumerate(groups):
-        n = n_slots_of(g, size_mib, n_zero, n_expert_used)
+    for ig, (g, n) in enumerate(zip(groups, group_slots(groups, size_mib, n_zero, n_expert_used))):
         caches.append(SLRU(g.layers, g.n_expert, n, lfu and share > 0.0) if n > 0 else None)
         group_of.update((il, ig) for il in g.layers)
 

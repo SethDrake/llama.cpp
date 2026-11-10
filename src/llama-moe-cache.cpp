@@ -528,6 +528,9 @@ struct llama_moe_cache::impl {
         }
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
+        // each miss of a token gets its own zero slot: batches of up to max_batch tokens read the slots, and CUDA MUL_MAT_ID
+        // does not support an expert repeated within a token for batches above 8 (TAG_MUL_MAT_ID_DUPLICATE_ID in
+        // test-backend-ops), so one shared slot would need those batches to upload their misses instead
         // one extra slot at the end, CUDA MMQ can read past the last expert
         n_zero = cpu_share > 0.0f ? std::min<int32_t>(n_expert_used, 64) : 0;
         auto alloc_size = [&](const group & g, int32_t n_slots) {
@@ -578,22 +581,50 @@ struct llama_moe_cache::impl {
             }
             write_trace_header(split_sum);
         }
+        // a group whose share cannot hold the experts of one token is not cached, and its share goes to the other groups:
+        // a model with mixed expert types has many small groups (Swift-Qwen3.8 IQ3_XXS: 9), and with a small budget most of
+        // them dropped out and left their share unused (256 MiB allocated 70 MiB)
+        std::vector<bool> active(groups.size(), true);
+        for (bool changed = true; changed; ) {
+            changed = false;
+            std::vector<size_t> active_bytes(devices.size(), 0);
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (active[ig]) {
+                    active_bytes[groups[ig].id] += groups[ig].host_bytes;
+                }
+            }
+            // a device left without cached groups gives its share to the other devices too
+            double active_split = 0.0;
+            for (size_t id = 0; id < devices.size(); ++id) {
+                active_split += active_bytes[id] > 0 ? devices[id].split : 0.0;
+            }
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                g.n_slots = 0;
+                if (!active[ig]) {
+                    continue;
+                }
+                const device & d = devices[g.id];
+                const size_t  budget    = (size_t) ((double) size*d.split/active_split*g.host_bytes/active_bytes[g.id]);
+                const int32_t max_slots = g.layers.size()*g.ref[0]->ne[2];
+                while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+                    g.n_slots++;
+                }
+                if (g.n_slots < n_expert_used) {
+                    active[ig] = false;
+                    changed    = true;
+                }
+            }
+        }
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
-        for (group & g : groups) {
-            const device & d = devices[g.id];
-            const int32_t n_expert  = g.ref[0]->ne[2];
-            const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
-            const int32_t max_slots = g.layers.size()*n_expert;
-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
-                g.n_slots++;
-            }
-            if (g.n_slots < n_expert_used) {
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (!active[ig]) {
                 LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
-                g.n_slots = 0;
                 continue;
             }
-            g.slru.init(model.layers.size(), n_expert, g.n_slots, lfu);
+            g.slru.init(model.layers.size(), g.ref[0]->ne[2], g.n_slots, lfu);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 2 : 1); // slot map and CPU map
         }
