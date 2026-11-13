@@ -2610,7 +2610,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
 
-        moe_cache->set_cpu_part(lookup, n_expert_used, { lookup->src[1], cur });
+        moe_cache->set_cpu_part(lookup, n_expert_used, { lookup->src[1], cur }, weights);
 
         experts = ggml_add(ctx0, experts_dev, experts_cpu);
         ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));

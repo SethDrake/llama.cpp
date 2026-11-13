@@ -602,6 +602,7 @@ struct common_params {
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
     int32_t moe_tail_skip      = 0;    // skip the MoE cache misses that every token selects at this rank or later, 0 = off
     int32_t moe_cache_policy   = 0;    // 0 = SLRU, 1 = LFU with decay
+    float  moe_tail_ratio      = 0.0f; // with moe_tail_skip, skip only the tail misses below this share of the token's top router weight, 0 = off
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

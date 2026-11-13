@@ -395,6 +395,7 @@ llama_context::llama_context(
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.moe_tail_skip       = params.moe_tail_skip;
     cparams.moe_cache_policy    = params.moe_cache_policy;
+    cparams.moe_tail_ratio      = params.moe_tail_ratio;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -615,7 +616,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, cparams.moe_tail_skip, cparams.moe_cache_policy);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, cparams.moe_tail_skip, cparams.moe_tail_ratio, cparams.moe_cache_policy);
         }
 
         sched_reserve();
@@ -4284,6 +4285,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.moe_tail_skip               =*/ 0,
         /*.moe_cache_policy            =*/ 0,
+        /*.moe_tail_ratio              =*/ 0.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

@@ -403,6 +403,7 @@ extern "C" {
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
         int32_t moe_tail_skip;      // skip the MoE cache misses that every token selects at this rank or later, 0 = off [EXPERIMENTAL]
         int32_t moe_cache_policy;   // 0 = SLRU, 1 = LFU with decay (needs moe_cache_cpu_share > 0) [EXPERIMENTAL]
+        float  moe_tail_ratio;      // with moe_tail_skip, skip only the tail misses whose router weight is below this share of the token's top weight, 0 = off [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

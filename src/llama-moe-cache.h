@@ -15,7 +15,7 @@ public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
     // policy 1 (LFU) uploads a miss only if it is used more often than the expert it evicts, the others go to the CPU; it needs cpu_share > 0 and ignores its value
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, int32_t policy);
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, float tail_ratio, int32_t policy);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -35,7 +35,7 @@ public:
 
     // the CPU part of the layer of the slot lookup, with n_used experts per token, no inputs if the graph has no CPU part
     // its inputs on the device are read together with the selected experts, so the CPU part does not wait for the device
-    void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs);
+    void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * weights = nullptr);
 
     // called before each graph compute
     void begin();

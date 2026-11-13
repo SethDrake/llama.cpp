@@ -42,6 +42,7 @@ struct moe_cache_slru {
     std::vector<int32_t> uniq;
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+    std::vector<float>    token_wmax; // [n_tokens] top router weight of each token
 
     // LFU with decay: use counts of every expert, halved after lfu_window lookups so that they follow the recent routing
     // (the routing of a MoE model changes within a few tokens, a long-term profile predicts it poorly)
@@ -170,11 +171,13 @@ struct moe_cache_slru {
     // a zero slot is used at most once per token, a miss that does not get one is cached instead
     // with tail_rank > 0, a miss that every token selects at rank tail_rank or later (ids are sorted by rank) also reads a
     // zero slot but is neither uploaded nor computed: it contributes zero, the other experts keep their weights
+    // with w (router weights in the layout of ids), such a miss is skipped only if every token weighs it below tail_ratio times
+    // the token's top weight
     // with lfu and has_cpu, n_cpu is not used: once the cache is full, the misses that do not win a slot go to the CPU
     // returns false if the ids select more distinct experts than there are slots
     template <typename F>
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, int32_t n_used, int32_t n_zero, bool has_cpu, F && n_cpu, uint64_t & rng,
-            int32_t tail_rank, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, size_t & n_skip) {
+            int32_t tail_rank, const float * w, float tail_ratio, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, size_t & n_skip) {
         fills.clear();
         cpu.clear();
         n_hit  = 0;
@@ -246,12 +249,18 @@ struct moe_cache_slru {
         };
 
         if (tail_rank > 0 && tail_rank < n_used && n_zero > 0) {
+            if (w != nullptr) {
+                token_wmax.assign(n_tokens, 0.0f);
+                for (size_t j = 0; j < n_ids; ++j) {
+                    token_wmax[j / n_used] = std::max(token_wmax[j / n_used], w[j]);
+                }
+            }
             size_t n_keep = misses.size();
             for (size_t i = 0; i < n_keep; ) {
                 const int32_t e = misses[i];
                 bool tail = true;
                 for (size_t j = 0; j < n_ids && tail; ++j) {
-                    tail = ids[j] != e || (int32_t) (j % n_used) >= tail_rank;
+                    tail = ids[j] != e || ((int32_t) (j % n_used) >= tail_rank && (w == nullptr || w[j] < tail_ratio * token_wmax[j / n_used]));
                 }
                 if (tail && take_zero(e) >= 0) {
                     n_skip++;
@@ -439,6 +448,8 @@ struct llama_moe_cache::impl {
 
     float    cpu_share = 0.0f;
     int32_t  tail_rank = 0;   // misses selected only at this rank or later are skipped, 0 = off
+    float    tail_ratio = 0.0f; // > 0: of those, only the misses below this share of each token's top router weight are skipped
+    std::vector<float> wts;   // router weights of the last slot lookup, read with ids when tail_ratio > 0
     bool     lfu       = false; // LFU replacement instead of SLRU with random CPU misses
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
     int32_t  n_zero    = 0; // zero slots per group
@@ -448,6 +459,7 @@ struct llama_moe_cache::impl {
     struct cpu_part {
         int32_t n_used; // experts per token
         std::vector<const ggml_tensor *> inputs; // device tensors read by the CPU part
+        const ggml_tensor * weights = nullptr;   // router weights [1, n_used, n_tokens], read for tail_ratio
     };
     std::unordered_map<const ggml_tensor *, cpu_part> cpu_parts; // slot lookup -> CPU part, no inputs if there is no CPU part
 
@@ -473,9 +485,9 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, int32_t policy) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, float tail_ratio, int32_t policy) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)),
-            tail_rank(std::max(tail_rank, 0)), lfu(policy == 1) {
+            tail_rank(std::max(tail_rank, 0)), tail_ratio(std::clamp(tail_ratio, 0.0f, 1.0f)), lfu(policy == 1) {
         if (lfu && this->cpu_share <= 0.0f) {
             LLAMA_LOG_WARN("%s: the LFU MoE cache policy needs a CPU share > 0, using SLRU\n", __func__);
             lfu = false;
@@ -872,8 +884,8 @@ struct llama_moe_cache::impl {
         return false;
     }
 
-    void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs) {
-        cpu_parts[lookup] = { n_used, std::move(inputs) };
+    void set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * weights) {
+        cpu_parts[lookup] = { n_used, std::move(inputs), weights };
     }
 
     void begin() {
@@ -960,8 +972,33 @@ struct llama_moe_cache::impl {
 
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+
+        // the router weights for tail_ratio, only if this split does not compute them; otherwise the layer skips no tail misses
+        const float * w = nullptr;
+        const ggml_tensor * wt = has_cpu && tail_rank > 0 && tail_ratio > 0.0f ? it_cpu->second.weights : nullptr;
+        bool w_host = false;
+        if (wt != nullptr) {
+            const ggml_tensor * base = base_of(wt);
+            bool ok = wt->type == GGML_TYPE_F32 && ggml_is_contiguous(wt) && ggml_nelements(wt) == ggml_nelements(sel) &&
+                base->buffer != nullptr && wt->data != nullptr && (ggml_backend_buffer_is_host(base->buffer) ||
+                ggml_backend_buffer_get_type(base->buffer) == ggml_backend_dev_buffer_type(ggml_backend_get_device(backend)));
+            for (int i = 0; i < n_nodes && ok; ++i) {
+                ok = ggml_graph_node(graph, i) != base;
+            }
+            if (ok) {
+                wts.resize(ggml_nelements(wt));
+                w_host = ggml_backend_buffer_is_host(base->buffer);
+                if (!w_host) {
+                    ggml_backend_tensor_get_async(backend, wt, wts.data(), 0, ggml_nbytes(wt));
+                }
+                w = wts.data();
+            }
+        }
         const int64_t t1 = timing_on ? ggml_time_us() : 0;
         ggml_backend_synchronize(backend);
+        if (w_host) {
+            ggml_backend_tensor_get(wt, wts.data(), 0, ggml_nbytes(wt));
+        }
         const int64_t t2 = timing_on ? ggml_time_us() : 0;
 
         if (trace != nullptr) {
@@ -978,7 +1015,7 @@ struct llama_moe_cache::impl {
         size_t n_hit  = 0;
         size_t n_skip = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), has_cpu ? it_cpu->second.n_used : 1, n_zero, has_cpu, n_cpu, rng,
-                has_cpu ? tail_rank : 0, fills, cpu, n_hit, n_skip)) {
+                has_cpu && (tail_ratio <= 0.0f || w != nullptr) ? tail_rank : 0, w, tail_ratio, fills, cpu, n_hit, n_skip)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
@@ -1055,8 +1092,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, int32_t policy) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, tail_rank, policy)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, float tail_ratio, int32_t policy) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, tail_rank, tail_ratio, policy)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -1081,8 +1118,8 @@ ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il) const {
     return il >= 0 && il < (int32_t) pimpl->layers.size() ? pimpl->layers[il].cpu_map : nullptr;
 }
 
-void llama_moe_cache::set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs) {
-    pimpl->set_cpu_part(lookup, n_used, std::move(inputs));
+void llama_moe_cache::set_cpu_part(const ggml_tensor * lookup, int32_t n_used, std::vector<const ggml_tensor *> inputs, const ggml_tensor * weights) {
+    pimpl->set_cpu_part(lookup, n_used, std::move(inputs), weights);
 }
 
 void llama_moe_cache::begin() {

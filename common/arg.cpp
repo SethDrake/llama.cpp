@@ -2764,6 +2764,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_TAIL_SKIP"));
     add_opt(common_arg(
+        {"--moe-tail-ratio"}, "T",
+        string_format("with --moe-tail-skip N, skip a tail miss only if, for every token that selects it, its router weight is below T times "
+            "the token's top weight (adaptive expert count, like SER); 0 = skip every tail miss (default: %.2f)", (double) params.moe_tail_ratio),
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (!(ratio >= 0.0f && ratio <= 1.0f)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_tail_ratio = ratio;
+        }
+    ).set_env("LLAMA_ARG_MOE_TAIL_RATIO"));
+    add_opt(common_arg(
         {"--moe-cache-policy"}, "{slru,lfu}",
         "MoE cache replacement: slru = segmented LRU, the misses left to the GPU by --moe-cache-cpu-share are picked at random; "
             "lfu = use counts with decay, a miss is uploaded only if it is used more often than the expert it evicts, the others are "
