@@ -50,6 +50,12 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+// layout (ggml_cuda_q8_1_layout):
+//   AOS  plain block_q8_1, d * (int sum of q) in ds.y
+//   PT   planar-transposed layout of the PTQ1_0 mat-vec (mmvq-ptq1_0.cuh): per column, plane t = 0..7 holds
+//        byte e % 16 of 128-element block kb at ((e / 16)*nblk + kb)*16, plane 8 holds 4 half2 (d, raw int sum
+//        of q) per block; same quantization and the same bytes per row as block_q8_1
+template <ggml_cuda_q8_1_layout layout>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -90,6 +96,24 @@ static __global__ void quantize_q8_1(
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
     const int sum = warp_reduce_sum<QK8_1>((int) q);
+
+    if constexpr (layout == GGML_CUDA_Q8_1_PT) {
+        const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
+        char * ycol = (char *) vy + row_cont * (ne0 * 9 / 8); // same column stride as block_q8_1
+        const int64_t nblk = ne0 / QK_PTQ1_0;
+        const int64_t kb   = i0 / QK_PTQ1_0;
+        const int     e    = i0 % QK_PTQ1_0;
+        ycol[((e / 16)*nblk + kb) * 16 + (e % 16)] = q;
+
+        if (iqs > 0) {
+            return;
+        }
+
+        // |sum| <= 32*127 fits int16; keep the raw bits in the half slot (read back with __half_as_short)
+        half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
+        *ds = make_half2(__float2half(d), __short_as_half((short) sum));
+        return;
+    }
 
     y[ib].qs[iqs] = q;
 
@@ -561,6 +585,14 @@ void quantize_row_q8_1_cuda(
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(!ids);
+    quantize_row_q8_1_layout_cuda(x, vy, GGML_CUDA_Q8_1_AOS, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
+    GGML_UNUSED(type_src0);
+}
+
+void quantize_row_q8_1_layout_cuda(
+        const float * x, void * vy, const ggml_cuda_q8_1_layout layout,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
@@ -569,8 +601,17 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
-    GGML_UNUSED(type_src0);
+    switch (layout) {
+        case GGML_CUDA_Q8_1_AOS:
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_AOS>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        case GGML_CUDA_Q8_1_PT:
+            GGML_ASSERT(ne0 % QK_PTQ1_0 == 0);
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PT>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
 }
 
 void quantize_mmq_q8_1_cuda(

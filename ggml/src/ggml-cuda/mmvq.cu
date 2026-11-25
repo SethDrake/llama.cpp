@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-ptq1_0.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1590,6 +1591,19 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    // PTQ1_0, plain 2D (one channel, one sample), 1-8 columns: dedicated kernel on the planar-transposed
+    // activation layout (mmvq-ptq1_0.cuh). Every other call takes the generic path below.
+    if (src0->type == GGML_TYPE_PTQ1_0 && !ids && ne2 == 1 && ne3 == 1 && fusion_local.shared_up == nullptr &&
+            ptq1_0_pt_usable(ne00, ne01, ne11, fusion_local.gate != nullptr)) {
+        ggml_cuda_pool_alloc<char> src1_pt(ctx.pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        quantize_row_q8_1_layout_cuda(src1_d, src1_pt.get(), GGML_CUDA_Q8_1_PT, ne10,
+            src1->nb[1] / ts_src1, src1->nb[2] / ts_src1, src1->nb[3] / ts_src1, ne10_padded, ne11, 1, 1, stream);
+        mul_mat_vec_ptq1_0_pt_switch(src0->data, src1_pt.get(), fusion_local, dst_d, ne00, ne01, ne11,
+            nb01 / ts_src0, ne10_padded / QK8_1, nb1 / ts_dst, stream);
+        return;
+    }
+
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     {
         const int64_t s11 = src1->nb[1] / ts_src1;

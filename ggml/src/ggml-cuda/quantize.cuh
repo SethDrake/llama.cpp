@@ -21,6 +21,17 @@ void quantize_row_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// Byte order of the q8_1 activations inside one column. Every layout keeps block_q8_1's bytes per row,
+// so strides in block_q8_1 units stay valid; only the consuming kernel differs.
+enum ggml_cuda_q8_1_layout : int {
+    GGML_CUDA_Q8_1_AOS = 0, // plain block_q8_1 array, what quantize_row_q8_1_cuda writes
+    GGML_CUDA_Q8_1_PT  = 1, // PTQ1_0 planar-transposed layout with exact int sums (mmvq-ptq1_0.cuh)
+};
+
+void quantize_row_q8_1_layout_cuda(
+        const float * x, void * vy, ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
