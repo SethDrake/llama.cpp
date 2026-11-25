@@ -26,7 +26,23 @@ void quantize_row_q8_1_cuda(
 enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_AOS = 0, // plain block_q8_1 array, what quantize_row_q8_1_cuda writes
     GGML_CUDA_Q8_1_PT  = 1, // PTQ1_0 planar-transposed layout with exact int sums (mmvq-ptq1_0.cuh)
+    GGML_CUDA_Q8_1_SOA = 2, // PTQ1_0 one-column warp-transposed layout with exact int sums, see ggml_cuda_ptq1_soa_word
 };
+
+// Warp-transposed (SoA) layout: one 128-weight PTQ1_0 K-block consumes 4 block_q8_1 = 36 words (32 qs, 4 ds).
+// K-blocks are grouped by 32 and word w of a group is stored for its 32 K-blocks back to back, so a warp whose
+// lanes own consecutive K-blocks loads one word as 32 consecutive words. ne0 is padded to a whole group, so the
+// column stride stays the block_q8_1 one.
+#define GGML_CUDA_PTQ1_SOA_GROUP_KB    32
+#define GGML_CUDA_PTQ1_SOA_GROUP_WORDS (GGML_CUDA_PTQ1_SOA_GROUP_KB * 36)
+#define GGML_CUDA_PTQ1_SOA_K_PAD       (GGML_CUDA_PTQ1_SOA_GROUP_KB * QK_PTQ1_0)
+
+// Word offset within one column of word w (0..7 = qs words, 8 = ds as (d, raw int sum)) of block_q8_1 ib.
+static constexpr __host__ __device__ int ggml_cuda_ptq1_soa_word(const int ib, const int w) {
+    return (ib >> 7) * GGML_CUDA_PTQ1_SOA_GROUP_WORDS
+        + (w < 8 ? (ib & 3) * 8 + w : 32 + (ib & 3)) * GGML_CUDA_PTQ1_SOA_GROUP_KB
+        + ((ib >> 2) & 31);
+}
 
 void quantize_row_q8_1_layout_cuda(
         const float * x, void * vy, ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,

@@ -12609,6 +12609,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PTQ1_0 one column on the CUDA SoA kernel: warp per row (fewer than 128 K-blocks, a row count that leaves a
+    // partial CTA), split K (16384) and a K that is padded to a whole 32-block group (17408)
+    for (int64_t k : {256, 4096, 16384, 17408}) {
+        for (int64_t m : {7, 33}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+        for (bool with_bias : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 33, k,
+                false, 16, 8, false, with_bias, true, false, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 33, k,
+            false, 16, 8, false, true, false, false, {1, 1}));
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {

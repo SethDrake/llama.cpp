@@ -55,6 +55,7 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 //   PT   planar-transposed layout of the PTQ1_0 mat-vec (mmvq-ptq1_0.cuh): per column, plane t = 0..7 holds
 //        byte e % 16 of 128-element block kb at ((e / 16)*nblk + kb)*16, plane 8 holds 4 half2 (d, raw int sum
 //        of q) per block; same quantization and the same bytes per row as block_q8_1
+//   SOA  warp-transposed layout of the one-column PTQ1_0 mat-vec (ggml_cuda_ptq1_soa_word), ds as (d, raw int sum)
 template <ggml_cuda_q8_1_layout layout>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
@@ -112,6 +113,21 @@ static __global__ void quantize_q8_1(
         // |sum| <= 32*127 fits int16; keep the raw bits in the half slot (read back with __half_as_short)
         half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
         *ds = make_half2(__float2half(d), __short_as_half((short) sum));
+        return;
+    }
+
+    if constexpr (layout == GGML_CUDA_Q8_1_SOA) {
+        const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
+        int32_t * ycol = (int32_t *) vy + row_cont * (ne0 / QK8_1) * (int64_t) (sizeof(block_q8_1) / 4);
+        const int ib_col = (int) (i0 / QK8_1);
+        ((int8_t *) (ycol + ggml_cuda_ptq1_soa_word(ib_col, iqs / 4)))[iqs % 4] = q;
+
+        if (iqs > 0) {
+            return;
+        }
+
+        const half2 ds = make_half2(__float2half(d), __short_as_half((short) sum));
+        ycol[ggml_cuda_ptq1_soa_word(ib_col, 8)] = *reinterpret_cast<const int32_t *>(&ds);
         return;
     }
 
@@ -608,6 +624,10 @@ void quantize_row_q8_1_layout_cuda(
         case GGML_CUDA_Q8_1_PT:
             GGML_ASSERT(ne0 % QK_PTQ1_0 == 0);
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PT>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        case GGML_CUDA_Q8_1_SOA:
+            GGML_ASSERT(ne0 % GGML_CUDA_PTQ1_SOA_K_PAD == 0);
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_SOA>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
             break;
         default:
             GGML_ABORT("fatal error");
