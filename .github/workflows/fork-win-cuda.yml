@@ -56,6 +56,12 @@ jobs:
       - name: Install Ninja
         run: choco install ninja
 
+      # the image's MSVC STL (14.52) needs Clang 22, the preinstalled LLVM is 20 (as upstream release.yml)
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
