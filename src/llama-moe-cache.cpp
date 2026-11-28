@@ -54,12 +54,29 @@ struct moe_cache_lru {
     std::vector<int32_t> uniq;  // the distinct selected experts
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+    std::vector<float>    token_wmax; // [n_tokens] top router weight of each token
 
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+    // LFU with decay: use counts of every expert, halved after lfu_window lookups so that they follow the recent routing
+    // (the routing of a MoE model changes within a few tokens, a long-term profile predicts it poorly)
+    // once the cache is full, a miss is uploaded only if it beats the least used expert not selected now by lfu_margin,
+    // the other misses are computed on the CPU
+    static constexpr int32_t lfu_window_slots = 10; // decay period in lookups per slot, ~10 tokens for 1/50 of the experts
+    static constexpr int32_t lfu_margin       = 2;  // count lead an upload needs: an upload costs ~2x a CPU computation
+    bool lfu = false;
+    std::vector<uint16_t> cnt; // [n_layer*n_expert]
+    uint32_t lfu_window = 0;
+    uint32_t lfu_n_inc  = 0;
+
+    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, bool lfu) {
         GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
         this->empty    = n_slots;
+        this->lfu      = lfu;
+        if (lfu) {
+            cnt.assign((size_t) n_layer*n_expert, 0);
+            lfu_window = (uint32_t) n_slots*lfu_window_slots;
+        }
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
         prev.resize(n_slots);
@@ -176,6 +193,40 @@ struct moe_cache_lru {
         return res;
     }
 
+    // the least used expert of a full cache that is not selected in layer il now, -1 if every slot is
+    int32_t victim_lfu(int32_t il) const {
+        int32_t  res = -1;
+        uint32_t min = UINT32_MAX;
+        for (int32_t s = 0; s < n_slots; ++s) {
+            const int32_t key = key_of[s];
+            if (is_selected(il, key)) {
+                continue;
+            }
+            if (cnt[key] < min) {
+                min = cnt[key];
+                res = s;
+                if (min == 0) {
+                    break;
+                }
+            }
+        }
+        return res;
+    }
+
+    void lfu_count(int32_t il) {
+        for (int32_t e : uniq) {
+            uint16_t & c = cnt[make_key(il, e)];
+            c += c < UINT16_MAX;
+        }
+        lfu_n_inc += uniq.size();
+        if (lfu_n_inc >= lfu_window) {
+            lfu_n_inc = 0;
+            for (uint16_t & c : cnt) {
+                c >>= 1;
+            }
+        }
+    }
+
     struct fill {
         int32_t expert;
         int32_t slot;
@@ -184,13 +235,19 @@ struct moe_cache_lru {
     // give a slot to each expert selected by ids (n_tokens tokens) in layer il
     // n_cpu(n) of the n misses are left to the CPU and read a zero slot on the device, they are not cached
     // a zero slot is used at most once per token, a miss that does not get one is cached instead
+    // with tail_rank > 0, a miss that every token selects at rank tail_rank or later (ids are sorted by rank) also reads a
+    // zero slot but is neither uploaded nor computed: it contributes zero, the other experts keep their weights
+    // with w (router weights in the layout of ids), such a miss is skipped only if every token weighs it below tail_ratio times
+    // the token's top weight
+    // with lfu and has_cpu, n_cpu is not used: once the cache is full, the misses that do not win a slot go to the CPU
     // returns false if the ids select more distinct experts than there are slots
     template <typename F>
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, F && n_cpu,
-            std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit) {
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, bool has_cpu, F && n_cpu,
+            int32_t tail_rank, const float * w, float tail_ratio, std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, size_t & n_skip) {
         fills.clear();
         cpu.clear();
-        n_hit = 0;
+        n_hit  = 0;
+        n_skip = 0;
 
         if (++seen_gen == 0) {
             std::fill(seen.begin(), seen.end(), 0);
@@ -209,6 +266,9 @@ struct moe_cache_lru {
         }
 
         int32_t * slots = slot_map[il];
+        if (lfu) {
+            lfu_count(il);
+        }
 
         // update the CRF of all selected experts and promote hits before choosing victims for misses
         misses.clear();
@@ -223,55 +283,39 @@ struct moe_cache_lru {
             }
         }
 
-        // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
-        // all misses are used at the same clock, so their CRF compare without decay
-        const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
-        if (n_c > 0) {
-            std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
-                const float crf_a = crf[make_key(il, a)];
-                const float crf_b = crf[make_key(il, b)];
-                return crf_a != crf_b ? crf_a < crf_b : a < b;
-            });
-            GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
-            token_zero.assign(n_tokens, 0);
-            size_t n_keep = n_c;
-            for (size_t i = 0; i < n_keep; ) {
-                const int32_t e = misses[i];
-                uint64_t used = 0;
-                for (int64_t it = 0; it < n_tokens; ++it) {
-                    for (int32_t k = 0; k < n_used; ++k) {
-                        if (ids[it*n_used + k] == e) {
-                            used |= token_zero[it];
-                        }
-                    }
-                }
-                int32_t z = 0;
-                while (z < 64 && (used >> z & 1)) {
-                    z++;
-                }
-                if (z >= n_zero) {
-                    std::swap(misses[i], misses[--n_keep]);
-                    continue;
-                }
-                for (int64_t it = 0; it < n_tokens; ++it) {
-                    for (int32_t k = 0; k < n_used; ++k) {
-                        if (ids[it*n_used + k] == e) {
-                            token_zero[it] |= 1ull << z;
-                        }
-                    }
-                }
-                slots[e] = n_slots + z;
-                cpu.push_back({ e, n_slots + z });
-                i++;
-            }
-            misses.erase(misses.begin(), misses.begin() + n_keep);
-        }
+        GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
+        token_zero.assign(n_tokens, 0);
 
-        // fill the misses in expert order: victim() takes unused slots, and slots filled by one plan(), in list order,
-        // so consecutive experts often get consecutive slots and one upload
-        std::sort(misses.begin(), misses.end());
-        for (int32_t e : misses) {
-            const int32_t s = victim(il);
+        // gives expert e a zero slot not used yet by any of its tokens, returns the slot or -1
+        auto take_zero = [&](int32_t e) -> int32_t {
+            uint64_t used = 0;
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                for (int32_t k = 0; k < n_used; ++k) {
+                    if (ids[it*n_used + k] == e) {
+                        used |= token_zero[it];
+                    }
+                }
+            }
+            int32_t z = 0;
+            while (z < 64 && (used >> z & 1)) {
+                z++;
+            }
+            if (z >= n_zero) {
+                return -1;
+            }
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                for (int32_t k = 0; k < n_used; ++k) {
+                    if (ids[it*n_used + k] == e) {
+                        token_zero[it] |= 1ull << z;
+                    }
+                }
+            }
+            slots[e] = n_slots + z;
+            return n_slots + z;
+        };
+
+        // puts expert e into slot s, evicting its expert
+        auto put = [&](int32_t e, int32_t s) {
             if (key_of[s] >= 0) {
                 slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
             } else {
@@ -282,6 +326,87 @@ struct moe_cache_lru {
             slots[e]  = s;
             move(s, class_of(key));
             fills.push_back({ e, s });
+        };
+
+        if (tail_rank > 0 && tail_rank < n_used && n_zero > 0) {
+            if (w != nullptr) {
+                token_wmax.assign(n_tokens, 0.0f);
+                for (size_t j = 0; j < n_ids; ++j) {
+                    token_wmax[j / n_used] = std::max(token_wmax[j / n_used], w[j]);
+                }
+            }
+            size_t n_keep = misses.size();
+            for (size_t i = 0; i < n_keep; ) {
+                const int32_t e = misses[i];
+                bool tail = true;
+                for (size_t j = 0; j < n_ids && tail; ++j) {
+                    tail = ids[j] != e || ((int32_t) (j % n_used) >= tail_rank && (w == nullptr || w[j] < tail_ratio * token_wmax[j / n_used]));
+                }
+                if (tail && take_zero(e) >= 0) {
+                    n_skip++;
+                    std::swap(misses[i], misses[--n_keep]);
+                    continue;
+                }
+                i++;
+            }
+            misses.resize(n_keep);
+        }
+
+        if (lfu && has_cpu && n_zero > 0 && n_filled == n_slots) {
+            // the most used misses take the slots of less used experts, the others are computed on the CPU
+            const uint16_t * c = cnt.data() + make_key(il, 0);
+            std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) { return c[a] != c[b] ? c[a] > c[b] : a < b; });
+            size_t i = 0;
+            for (; i < misses.size(); ++i) {
+                const int32_t s = victim_lfu(il);
+                if (s < 0 || c[misses[i]] <= cnt[key_of[s]] + lfu_margin) {
+                    break; // the misses are sorted, the rest lose too
+                }
+                put(misses[i], s);
+            }
+            for (; i < misses.size(); ++i) {
+                const int32_t e = misses[i];
+                const int32_t s = take_zero(e);
+                if (s >= 0) {
+                    cpu.push_back({ e, s });
+                    continue;
+                }
+                // no zero slot left for one of its tokens: upload it anyway
+                const int32_t v = victim_lfu(il);
+                put(e, v >= 0 ? v : victim(il));
+            }
+            clock[il] += n_tokens;
+            return true;
+        }
+
+        // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
+        // all misses are used at the same clock, so their CRF compare without decay
+        const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
+        if (n_c > 0) {
+            std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
+                const float crf_a = crf[make_key(il, a)];
+                const float crf_b = crf[make_key(il, b)];
+                return crf_a != crf_b ? crf_a < crf_b : a < b;
+            });
+            size_t n_keep = n_c;
+            for (size_t i = 0; i < n_keep; ) {
+                const int32_t e = misses[i];
+                const int32_t s = take_zero(e);
+                if (s < 0) {
+                    std::swap(misses[i], misses[--n_keep]);
+                    continue;
+                }
+                cpu.push_back({ e, s });
+                i++;
+            }
+            misses.erase(misses.begin(), misses.begin() + n_keep);
+        }
+
+        // fill the misses in expert order: victim() takes unused slots, and slots filled by one plan(), in list order,
+        // so consecutive experts often get consecutive slots and one upload
+        std::sort(misses.begin(), misses.end());
+        for (int32_t e : misses) {
+            put(e, victim(il));
         }
         clock[il] += n_tokens;
         return true;
@@ -360,6 +485,8 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
         int32_t n_used = 0;                 // experts selected per token by the graph, set by build_lookup
+        const ggml_tensor * weights        = nullptr; // router weights of the last graph built, read for the tail ratio
+        const ggml_tensor * weights_lookup = nullptr; // the slot lookup of that graph, the weights are valid only for it
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
         std::vector<std::array<std::vector<float>, LLAMA_MOE_CACHE_SCALE_COUNT>> scales;
     };
@@ -375,6 +502,7 @@ struct llama_moe_cache::impl {
         size_t hits   = 0;
         size_t misses = 0;
         size_t cpu    = 0; // misses computed on the CPU
+        size_t skip   = 0; // tail misses skipped
         size_t bytes  = 0;
     };
 
@@ -397,11 +525,22 @@ struct llama_moe_cache::impl {
     std::vector<moe_cache_lru::fill> cpu;
 
     float    cpu_share = 0.0f;
+    int32_t  tail_rank = 0;   // misses selected only at this rank or later are skipped, 0 = off
+    float    tail_ratio = 0.0f; // > 0: of those, only the misses below this share of each token's top router weight are skipped
+    std::vector<float> wts;   // router weights of the last slot lookup, read with ids when tail_ratio > 0
+    bool     lfu       = false; // LFU replacement instead of ClassLRU
     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
     int32_t  n_zero    = 0; // zero slots per group
 
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
+
+    // host time of the copy callback for small ubatches, LLAMA_MOE_CACHE_TIMING=1 (profiling)
+    struct timing {
+        int64_t pre = 0, sync = 0, plan = 0, upload = 0, tail = 0;
+        size_t  calls = 0;
+    } tm;
+    const bool timing_on = getenv("LLAMA_MOE_CACHE_TIMING") != nullptr;
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -411,8 +550,13 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, float tail_ratio, int32_t policy) :
+            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)),
+            tail_rank(std::max(tail_rank, 0)), tail_ratio(std::clamp(tail_ratio, 0.0f, 1.0f)), lfu(policy == 1) {
+        if (lfu && this->cpu_share <= 0.0f) {
+            LLAMA_LOG_WARN("%s: the LFU MoE cache policy needs a CPU share > 0, using ClassLRU\n", __func__);
+            lfu = false;
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -482,6 +626,9 @@ struct llama_moe_cache::impl {
         }
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
+        // each miss of a token gets its own zero slot: batches of up to max_batch tokens read the slots, and CUDA MUL_MAT_ID
+        // does not support an expert repeated within a token for batches above 8 (TAG_MUL_MAT_ID_DUPLICATE_ID in
+        // test-backend-ops), so one shared slot would need those batches to upload their misses instead
         // one extra slot at the end, CUDA MMQ can read past the last expert
         n_zero = cpu_share > 0.0f ? std::min<int32_t>(n_expert_used, 64) : 0;
         auto alloc_size = [&](const group & g, int32_t n_slots) {
@@ -538,22 +685,50 @@ struct llama_moe_cache::impl {
             }
             write_trace_header(split_sum);
         }
+        // a group whose share cannot hold the experts of one token is not cached, and its share goes to the other groups:
+        // a model with mixed expert types has many small groups (Swift-Qwen3.8 IQ3_XXS: 9), and with a small budget most of
+        // them dropped out and left their share unused (256 MiB allocated 70 MiB)
+        std::vector<bool> active(groups.size(), true);
+        for (bool changed = true; changed; ) {
+            changed = false;
+            std::vector<size_t> active_bytes(devices.size(), 0);
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                if (active[ig]) {
+                    active_bytes[groups[ig].id] += groups[ig].host_bytes;
+                }
+            }
+            // a device left without cached groups gives its share to the other devices too
+            double active_split = 0.0;
+            for (size_t id = 0; id < devices.size(); ++id) {
+                active_split += active_bytes[id] > 0 ? devices[id].split : 0.0;
+            }
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                g.n_slots = 0;
+                if (!active[ig]) {
+                    continue;
+                }
+                const device & d = devices[g.id];
+                const size_t  budget    = (size_t) ((double) size*d.split/active_split*g.host_bytes/active_bytes[g.id]);
+                const int32_t max_slots = g.layers.size()*g.ref[0]->ne[2];
+                while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+                    g.n_slots++;
+                }
+                if (g.n_slots < n_expert_used) {
+                    active[ig] = false;
+                    changed    = true;
+                }
+            }
+        }
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
-        for (group & g : groups) {
-            const device & d = devices[g.id];
-            const int32_t n_expert  = g.ref[0]->ne[2];
-            const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
-            const int32_t max_slots = g.layers.size()*n_expert;
-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
-                g.n_slots++;
-            }
-            if (g.n_slots < n_expert_used) {
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            if (!active[ig]) {
                 LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
-                g.n_slots = 0;
                 continue;
             }
-            g.lru.init(model.layers.size(), n_expert, g.n_slots);
+            g.lru.init(model.layers.size(), g.ref[0]->ne[2], g.n_slots, lfu);
             size_t n_scales = 0;
             for (const auto & rows : g.scale_rows) {
                 n_scales += std::count_if(rows.begin(), rows.end(), [](int64_t r) { return r > 0; });
@@ -717,8 +892,13 @@ struct llama_moe_cache::impl {
             if (d.host_bytes == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %.0f%% of the misses on the CPU\n", __func__,
-                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, 100.0*cpu_share);
+            if (lfu) {
+                LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, LFU, misses that lose to the cached experts on the CPU\n", __func__,
+                    ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0);
+            } else {
+                LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %.0f%% of the misses on the CPU\n", __func__,
+                    ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, 100.0*cpu_share);
+            }
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%, %.1f tokens worth)\n", __func__,
@@ -867,6 +1047,7 @@ struct llama_moe_cache::impl {
         if (it == layer_of.end()) {
             return false;
         }
+        const int64_t t0 = timing_on ? ggml_time_us() : 0;
         const int32_t il      = it->second.first;
         const bool    has_cpu = it->second.second;
         layer & l = layers[il];
@@ -904,7 +1085,34 @@ struct llama_moe_cache::impl {
 
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+
+        // the router weights for tail_ratio, only if this split does not compute them; otherwise the layer skips no tail misses
+        const float * w = nullptr;
+        const ggml_tensor * wt = has_cpu && tail_rank > 0 && tail_ratio > 0.0f && l.weights_lookup == lookup ? l.weights : nullptr;
+        bool w_host = false;
+        if (wt != nullptr) {
+            const ggml_tensor * base = wt->view_src != nullptr ? wt->view_src : wt;
+            bool ok = wt->type == GGML_TYPE_F32 && ggml_is_contiguous(wt) && ggml_nelements(wt) == ggml_nelements(sel) &&
+                base->buffer != nullptr && wt->data != nullptr && (ggml_backend_buffer_is_host(base->buffer) ||
+                ggml_backend_buffer_get_type(base->buffer) == ggml_backend_dev_buffer_type(ggml_backend_get_device(backend)));
+            for (int i = 0; i < n_nodes && ok; ++i) {
+                ok = ggml_graph_node(graph, i) != base;
+            }
+            if (ok) {
+                wts.resize(ggml_nelements(wt));
+                w_host = ggml_backend_buffer_is_host(base->buffer);
+                if (!w_host) {
+                    ggml_backend_tensor_get_async(backend, wt, wts.data(), 0, ggml_nbytes(wt));
+                }
+                w = wts.data();
+            }
+        }
+        const int64_t t1 = timing_on ? ggml_time_us() : 0;
         ggml_backend_synchronize(backend);
+        if (w_host) {
+            ggml_backend_tensor_get(wt, wts.data(), 0, ggml_nbytes(wt));
+        }
+        const int64_t t2 = timing_on ? ggml_time_us() : 0;
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -917,8 +1125,10 @@ struct llama_moe_cache::impl {
             l.cpu_acc = acc & 0xffff;
             return (size_t) (acc >> 16);
         };
-        size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), n_tokens, n_used, n_zero, n_cpu, fills, cpu, n_hit)) {
+        size_t n_hit  = 0;
+        size_t n_skip = 0;
+        if (!g.lru.plan(il, ids.data(), ids.size(), n_tokens, n_used, n_zero, has_cpu, n_cpu,
+                has_cpu && (tail_ratio <= 0.0f || w != nullptr) ? tail_rank : 0, w, tail_ratio, fills, cpu, n_hit, n_skip)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
@@ -932,6 +1142,8 @@ struct llama_moe_cache::impl {
                 l.cpu_experts.push_back(f.expert);
             }
         }
+
+        const int64_t t3 = timing_on ? ggml_time_us() : 0;
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
@@ -958,14 +1170,23 @@ struct llama_moe_cache::impl {
             }
         }
 
+        const int64_t t4 = timing_on ? ggml_time_us() : 0;
+
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
-        st.misses += fills.size() + cpu.size();
+        st.misses += fills.size() + cpu.size() + n_skip;
         st.cpu    += cpu.size();
+        st.skip   += n_skip;
         st.bytes  += bytes;
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
+
+        if (timing_on && &st == &stats_small) {
+            const int64_t t5 = ggml_time_us();
+            tm.pre += t1 - t0; tm.sync += t2 - t1; tm.plan += t3 - t2; tm.upload += t4 - t3; tm.tail += t5 - t4;
+            tm.calls++;
+        }
 
         return true;
     }
@@ -976,10 +1197,14 @@ struct llama_moe_cache::impl {
             if (n == 0) {
                 return;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
-                name, st.hits, st.misses, st.cpu, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu (%zu on the CPU, %zu skipped), hit rate = %.2f%%, uploaded = %.2f MiB\n",
+                name, st.hits, st.misses, st.cpu, st.skip, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
         };
         log("ubatch <= 8", stats_small);
+        if (timing_on && tm.calls > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: timing (ubatch <= 8): %zu calls, ms total: pre %.1f, sync %.1f, plan %.1f, upload %.1f, tail %.1f\n",
+                tm.calls, tm.pre/1e3, tm.sync/1e3, tm.plan/1e3, tm.upload/1e3, tm.tail/1e3);
+        }
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
@@ -987,8 +1212,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, float tail_ratio, int32_t policy) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, tail_rank, tail_ratio, policy)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -1045,6 +1270,8 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     g.cb(slots, "ffn_moe_slots", il);
 
     pimpl->layers[il].n_used = (int32_t) selected_experts->ne[0];
+    pimpl->layers[il].weights        = layer.weights;
+    pimpl->layers[il].weights_lookup = slots;
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
     ggml_build_forward_expand(g.gf, slots);

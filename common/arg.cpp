@@ -2770,6 +2770,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--moe-tail-skip"}, "N",
+        string_format("skip the MoE cache misses that every token of the batch selects at rank N or later (0-based, by router score): "
+            "they are neither uploaded nor computed and contribute zero; needs --moe-cache-cpu-share > 0; changes the output slightly, 0 = off (default: %d)", params.moe_tail_skip),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_tail_skip = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_TAIL_SKIP"));
+    add_opt(common_arg(
+        {"--moe-tail-ratio"}, "T",
+        string_format("with --moe-tail-skip N, skip a tail miss only if, for every token that selects it, its router weight is below T times "
+            "the token's top weight (adaptive expert count, like SER); 0 = skip every tail miss (default: %.2f)", (double) params.moe_tail_ratio),
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (!(ratio >= 0.0f && ratio <= 1.0f)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_tail_ratio = ratio;
+        }
+    ).set_env("LLAMA_ARG_MOE_TAIL_RATIO"));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "{classlru,lfu}",
+        "MoE cache replacement: classlru = LRU per frequency class, the misses with the lowest use frequency go to the CPU by --moe-cache-cpu-share; "
+            "lfu = use counts with decay, a miss is uploaded only if it is used more often than the expert it evicts, the others are "
+            "computed on the CPU; lfu needs --moe-cache-cpu-share > 0 and ignores its value; slru is an alias of classlru (default: classlru)",
+        [](common_params & params, const std::string & value) {
+            if (value == "classlru" || value == "slru") {
+                params.moe_cache_policy = 0;
+            } else if (value == "lfu") {
+                params.moe_cache_policy = 1;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_POLICY"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

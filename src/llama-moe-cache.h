@@ -17,6 +17,7 @@ struct llama_moe_cache_layer {
     ggml_tensor * down_exps;
     ggml_tensor * gate_up_exps;
     bool          weight_before_ffn; // the router weights scale the expert input
+    ggml_tensor * weights;           // router weights [1, n_expert_used, n_tokens], computed before the lookup, read for the tail ratio
 };
 
 // the lookup of the selected experts of a layer in the MoE cache, see llama_moe_cache::build_lookup
@@ -42,7 +43,8 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    // policy 1 (LFU) uploads a miss only if it is used more often than the expert it evicts, the others go to the CPU; it needs cpu_share > 0 and ignores its value
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, int32_t tail_rank, float tail_ratio, int32_t policy);
     ~llama_moe_cache();
 
     // the experts of w in the cache, nullptr if w is not cached
