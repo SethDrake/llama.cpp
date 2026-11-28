@@ -1,0 +1,180 @@
+# Fork build: Windows x64 CUDA 12.4 and 13.4 packages laid out like the upstream release
+# (CPU backends + llama-server built with clang, ggml-cuda built with MSVC/nvcc) and the CUDA runtime as a separate
+# archive, named as upstream names them so that LLManager installs both the same way.
+# A pushed tag fork-b<upstream build>.<n> (fork-b12110.1) publishes a release; a branch push only builds as a check.
+# Path filters are not evaluated for tag pushes.
+name: Fork Windows CUDA
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'fork-b*'
+    branches:
+      - 'perf/**'
+    paths: [
+      '.github/workflows/fork-win-cuda.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.cu',
+      '**/*.cuh'
+    ]
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DLLAMA_CONNECT=ON"
+
+concurrency:
+  group: fork-win-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-build:
+    uses: ./.github/workflows/ui-build.yml
+
+  windows-cpu:
+    needs: [ui-build]
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download UI build
+        uses: actions/download-artifact@v8
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      # the image's MSVC STL (14.52) needs Clang 22, the preinstalled LLVM is 20 (as upstream release.yml)
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: fork-windows-2025-vs2026-x64-cpu
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cpu-bin
+          path: build/bin/Release/*
+
+  windows-cuda:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        cuda: ['12.4', '13.4']
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: fork-windows-2022-x64-cuda-${{ matrix.cuda }}
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Collect ggml-cuda and the CUDA runtime
+        run: |
+          New-Item -ItemType Directory -Force .\out, .\rt | Out-Null
+          Copy-Item .\build\bin\Release\ggml-cuda.dll .\out\
+          robocopy "${{ env.CUDA_PATH }}\bin" .\rt cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\lib" .\rt cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\bin\x64" .\rt cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          exit 0
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cuda-bin-${{ matrix.cuda }}
+          path: out/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cudart-bin-${{ matrix.cuda }}
+          path: rt/*
+
+  package:
+    needs: [windows-cpu, windows-cuda]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: cpu-bin
+          path: cpu
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cuda*-bin-*
+          path: cuda
+
+      # Upstream names: llama-<tag>-bin-win-cuda-<v>-x64.zip and cudart-llama-bin-win-cuda-<v>-x64.zip.
+      - name: Pack
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then name="$GITHUB_REF_NAME"; else name="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"; fi
+          mkdir dist
+          for v in 12.4 13.4; do
+            rm -rf pkg && cp -r cpu pkg && cp cuda/cuda-bin-$v/* pkg/
+            test -f pkg/llama-server.exe && test -f pkg/ggml-cuda.dll && ls cuda/cudart-bin-$v/cudart64_*.dll
+            (cd pkg && zip -qr "../dist/llama-$name-bin-win-cuda-$v-x64.zip" .)
+            (cd cuda/cudart-bin-$v && zip -qr "../../dist/cudart-llama-bin-win-cuda-$v-x64.zip" .)
+          done
+          ls -l dist
+
+      # A public release per fork-b* tag: downloadable without a token; GitHub adds the sha256 digests LLManager checks.
+      - name: Publish release
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'fork-b')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes "Fork build of $GITHUB_REF_NAME at $GITHUB_SHA (Windows x64, CUDA 12.4 and 13.4)"
